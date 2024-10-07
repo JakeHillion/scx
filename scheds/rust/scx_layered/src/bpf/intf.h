@@ -34,14 +34,17 @@ enum consts {
 	MAX_TASKS		= 131072,
 	MAX_PATH		= 4096,
 	MAX_NUMA_NODES		= 64,
-	MAX_DOMS		= 64,
+	MAX_LLCS		= 64,
 	MAX_COMM		= 16,
 	MAX_LAYER_MATCH_ORS	= 32,
 	MAX_LAYERS		= 16,
+	MAX_LAYER_WEIGHT	= 10000,
+	MIN_LAYER_WEIGHT	= 1,
+	DEFAULT_LAYER_WEIGHT	= 100,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
 
-	HI_FALLBACK_DSQ_BASE	= MAX_LAYERS * MAX_DOMS,
-	LO_FALLBACK_DSQ		= (MAX_LAYERS * MAX_DOMS) + MAX_DOMS + 1,
+	HI_FALLBACK_DSQ_BASE	= MAX_LAYERS * MAX_LLCS,
+	LO_FALLBACK_DSQ		= (MAX_LAYERS * MAX_LLCS) + MAX_LLCS + 1,
 
 	/* XXX remove */
 	MAX_CGRP_PREFIXES = 32
@@ -92,6 +95,7 @@ struct cpu_ctx {
 	bool			maybe_idle;
 	bool			yielding;
 	bool			try_preempt_first;
+	bool			is_big;
 	u64			layer_cycles[MAX_LAYERS];
 	u64			gstats[NR_GSTATS];
 	u64			lstats[MAX_LAYERS][NR_LSTATS];
@@ -150,13 +154,21 @@ struct layer_match_ands {
 };
 
 enum layer_growth_algo {
-    STICKY,
-    LINEAR,
-    RANDOM,
-    TOPO,
-    ROUND_ROBIN,
-    BIG_LITTLE,
-    LITTLE_BIG,
+	GROWTH_ALGO_STICKY,
+	GROWTH_ALGO_LINEAR,
+	GROWTH_ALGO_REVERSE,
+	GROWTH_ALGO_RANDOM,
+	GROWTH_ALGO_TOPO,
+	GROWTH_ALGO_ROUND_ROBIN,
+	GROWTH_ALGO_BIG_LITTLE,
+	GROWTH_ALGO_LITTLE_BIG,
+};
+
+enum dsq_iter_algo {
+	DSQ_ITER_LINEAR,
+	DSQ_ITER_ROUND_ROBIN,
+	DSQ_ITER_WEIGHT,
+	DSQ_ITER_REVERSE_WEIGHT,
 };
 
 struct layer {
@@ -167,10 +179,12 @@ struct layer {
 	u64			max_exec_ns;
 	u64			yield_step_ns;
 	u64			slice_ns;
+	u32			weight;
 	bool			open;
 	bool			preempt;
 	bool			preempt_first;
 	bool			exclusive;
+	bool			idle_smt;
 	int			growth_algo;
 
 	u64			vtime_now;

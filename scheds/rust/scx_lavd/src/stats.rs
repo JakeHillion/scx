@@ -10,10 +10,12 @@ use anyhow::bail;
 use anyhow::Result;
 use gpoint::GPoint;
 use scx_stats::prelude::*;
+use scx_stats_derive::stat_doc;
 use scx_stats_derive::Stats;
 use serde::Deserialize;
 use serde::Serialize;
 
+#[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct SysStats {
@@ -125,6 +127,7 @@ impl SysStats {
     }
 }
 
+#[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 pub struct SchedSample {
     #[stat(desc = "Sequence ID of this message")]
@@ -165,8 +168,8 @@ pub struct SchedSample {
     pub wake_freq: u64,
     #[stat(desc = "Performance criticality of this task")]
     pub perf_cri: u32,
-    #[stat(desc = "Average performance criticality in a system")]
-    pub avg_perf_cri: u32,
+    #[stat(desc = "Performance criticality threshold")]
+    pub thr_perf_cri: u32,
     #[stat(desc = "Target performance level of this CPU")]
     pub cpuperf_cur: u32,
     #[stat(desc = "CPU utilization of this particular CPU")]
@@ -205,7 +208,7 @@ impl SchedSample {
             "WAIT_FREQ",
             "WAKE_FREQ",
             "PERF_CRI",
-            "AVG_PC",
+            "THR_PC",
             "CPUFREQ",
             "CPU_UTIL",
             "NR_ACT",
@@ -246,7 +249,7 @@ impl SchedSample {
             self.wait_freq,
             self.wake_freq,
             self.perf_cri,
-            self.avg_perf_cri,
+            self.thr_perf_cri,
             self.cpuperf_cur,
             self.cpu_util,
             self.nr_active,
