@@ -118,7 +118,7 @@ static u32 dsq_iter_rr_cpu_ctx(u32 layer_idx, int idx)
  * Returns the iterator context for iterating over DSQs using the configured
  * DSQ iterator algorithm.
  */
-static u32 iter_layer_dsq_ctx(int idx, u32 layer_idx)
+u32 iter_layer_dsq_ctx(int idx, u32 layer_idx)
 {
 	switch (dsq_iter_algo) {
 	case DSQ_ITER_LINEAR: {
@@ -147,7 +147,7 @@ static __noinline u64 layer_dsq_id(u32 layer_id, u32 llc_id)
 	return (layer_id * nr_llcs) + llc_id;
 }
 
-static __noinline u32 cpu_to_llc_id(s32 cpu_id)
+static u32 cpu_to_llc_id(s32 cpu_id)
 {
         const volatile u32 *llc_ptr;
 
@@ -1214,11 +1214,87 @@ no:
 	return false;
 }
 
+static __always_inline
+void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev) {
+	struct cpu_ctx *cctx, *sib_cctx;
+	u32 idx;
+	u64 dsq_id;
+
+  s32 sib = sibling_cpu(cpu);
+
+	if (!(cctx = lookup_cpu_ctx(-1)))
+		return;
+
+	/*
+	 * if @prev was on SCX and is still runnable, we are here because @prev
+	 * has exhausted its slice. We may want to keep running it on this CPU
+	 * rather than giving this CPU to another task and then try to schedule
+	 * @prev somewhere else.
+	 *
+	 * Let's not dispatch any task if we want to keep running @prev. This
+	 * will trigger the automatic local enq behavior which will put @prev on
+	 * @cpu's local DSQ. A more straightforward way to implement this would
+	 * be extending slice from ops.tick() but that's not available in older
+	 * kernels, so let's make do with this for now.
+	 */
+	if (prev && keep_running(cctx, prev))
+		return;
+
+	/*
+	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
+	 * This test is a racy test but should be good enough for best-effort
+	 * optimization.
+	 */
+	if (sib >= 0 && (sib_cctx = lookup_cpu_ctx(sib)) &&
+	    sib_cctx->current_exclusive) {
+		gstat_inc(GSTAT_EXCL_IDLE, cctx);
+		return;
+	}
+
+	/* consume preempting layers first */
+	bpf_for(idx, 0, nr_layers) {
+		if (MEMBER_VPTR(layers, [idx].preempt) && scx_bpf_consume(idx))
+			return;
+	}
+
+	dsq_id = cpu_hi_fallback_dsq_id(cpu);
+	if (scx_bpf_consume(dsq_id))
+		return;
+
+	/* consume !open layers second */
+	bpf_for(idx, 0, nr_layers) {
+		struct layer *layer = &layers[idx];
+		struct cpumask *layer_cpumask;
+
+		/* consume matching layers */
+		if (!(layer_cpumask = lookup_layer_cpumask(idx)))
+			return;
+
+		if (bpf_cpumask_test_cpu(cpu, layer_cpumask) ||
+		    (cpu == fallback_cpu && layer->nr_cpus == 0)) {
+			if (scx_bpf_consume(idx))
+				return;
+		}
+	}
+
+	/* consume !preempting open layers */
+	bpf_for(idx, 0, nr_layers) {
+		if (!layers[idx].preempt && layers[idx].open &&
+		    scx_bpf_consume(idx))
+			return;
+	}
+
+	scx_bpf_consume(LO_FALLBACK_DSQ);
+}
+
 void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 {
+  if (disable_topology)
+    return layered_dispatch_no_topo(cpu, prev);
+
 	s32 sib = sibling_cpu(cpu);
 	struct cpu_ctx *cctx, *sib_cctx;
-	u32 idx, llc_id, layer_idx;
+	u32 idx, llc_idx, layer_idx;
 	u64 dsq_id;
 
 	if (!(cctx = lookup_cpu_ctx(-1)))
@@ -1252,84 +1328,75 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 	// Adjust the per cpu layer offset so that layers are iterated in a
 	// round robin order if using that algorithm for dsq iteration.
-	if (!disable_topology && dsq_iter_algo == DSQ_ITER_ROUND_ROBIN)
+	if (dsq_iter_algo == DSQ_ITER_ROUND_ROBIN)
 		cpu_ctx_layer_idx_inc(cctx);
 
+  if (nr_layers >= MAX_LAYERS) {
+    scx_bpf_error("nr_layers must be < MAX_LAYERS!");
+    return;
+  }
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = iter_layer_dsq_ctx(idx, cctx->layer_idx);
-		bool preempt = MEMBER_VPTR(layers, [layer_idx].preempt);
-		bool open = MEMBER_VPTR(layers, [layer_idx].open);
-		u32 layer_cpus = *MEMBER_VPTR(layers[layer_idx], .nr_cpus);
 		struct cpumask *layer_cpumask;
-		bool have_layer_cpumask = layer_cpumask = lookup_layer_cpumask(idx);
+
+		layer_idx = iter_layer_dsq_ctx(idx, cctx->layer_idx);
+    if (layer_idx >= MAX_LAYERS) {
+      scx_bpf_error("layer_idx must be < MAX_LAYERS!");
+      return;
+    }
+
+    struct layer *layer = &layers[layer_idx];
+		layer_cpumask = lookup_layer_cpumask(layer_idx);
+    bool have_layer_cpumask = !!layer_cpumask;
+
 		bool cpumask_test = false;
 		if (have_layer_cpumask)
 			cpumask_test = bpf_cpumask_test_cpu(cpu, layer_cpumask);
-		bool layer_matches = (have_layer_cpumask && 
+		bool layer_matches = (have_layer_cpumask &&
 							(cpumask_test ||
-							(cpu <= nr_possible_cpus && 
+							(cpu <= nr_possible_cpus &&
 							cpu == fallback_cpu &&
-							layer_cpus == 0))); 
-		
-		if (disable_topology) {
-			/* consume preempting layers first */
-			if (preempt && scx_bpf_consume(idx))
-				return;
+							layer->nr_cpus == 0)));
 
-			/* make sure hi fallback dsq is empty */
-		    dsq_id = cpu_hi_fallback_dsq_id(cpu);
+		u64 matching_dsq;
+		u64 non_preempting_open_dsq;
+
+		u32 my_llc_id = cpu_to_llc_id(cpu);
+
+    if (nr_llcs >= MAX_LLCS) {
+      scx_bpf_error("nr_llcs must be < MAX_DOMS!");
+      return;
+    }
+		bpf_for(llc_idx, 0, nr_llcs) {
+			u32 llc_id = (llc_idx + my_llc_id) % nr_llcs;
+
+			dsq_id = layer_dsq_id(layer_idx, llc_id);
+			/* consume preempting layers first, with no delay */
+			if (layer->preempt && scx_bpf_consume(dsq_id))
+				return;
+			dsq_id = llc_hi_fallback_dsq_id(llc_id);
+			/* make sure hi fallback dsq is empty, with no delay  */
 			if (scx_bpf_consume(dsq_id))
 				return;
 
 			/* consume matching layers */
-			if (have_layer_cpumask)
-			{
-				if (cpumask_test ||
-					(cpu == fallback_cpu && layer_cpus == 0)) {
-					if (scx_bpf_consume(idx))
-						return;
-				}
+			if (layer_matches && !matching_dsq){
+				matching_dsq = dsq_id;
+				break;
 			}
+			/* consume !preempting open layers */
+			if ((!layer->preempt && layer->open) && !non_preempting_open_dsq
+				&& matching_dsq)
+					non_preempting_open_dsq = dsq_id;
+		}
 
-			/* consume !preempting open layers */			
-			if (!layers[idx].preempt && layers[idx].open &&
-			    scx_bpf_consume(idx))
+		/* preserve priority order of dsq execution */
+		if (matching_dsq != -1) {
+			if (scx_bpf_consume(matching_dsq))
 				return;
-
-		} else {
-			u64 matching_dsq = -1;
-			u64 non_preempting_open_dsq;
-
-			bpf_for(llc_id, 0, nr_llcs) {
-				dsq_id = layer_dsq_id(layer_idx, llc_id);
-				/* consume preempting layers first, with no delay */
-				if (preempt && scx_bpf_consume(dsq_id))
-					return;
-				dsq_id = llc_hi_fallback_dsq_id(llc_id);
-				/* make sure hi fallback dsq is empty, with no delay  */
-				if (scx_bpf_consume(dsq_id))
-					return;
-
-				/* consume matching layers */
-				if (layer_matches && matching_dsq == -1) {
-					matching_dsq = dsq_id;
-					break;
-				}
-				/* consume !preempting open layers */			
-				if ((!preempt && open) && !non_preempting_open_dsq 
-					&& matching_dsq)
-						non_preempting_open_dsq = dsq_id;
-			}
-
-			/* preserve priority order of dsq execution */
-			if (matching_dsq != -1) {
-				if (scx_bpf_consume(matching_dsq))
-					return;
-			}
-			if(!non_preempting_open_dsq) {
-				if (scx_bpf_consume(non_preempting_open_dsq))
-					return;
-			}
+		}
+		if(!non_preempting_open_dsq) {
+			if (scx_bpf_consume(non_preempting_open_dsq))
+				return;
 		}
 	}
 	/* consume lo fallback dsq */
