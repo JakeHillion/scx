@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::bpf_intf;
 use crate::LayerGrowthAlgo;
 use crate::bpf_intf;
 
