@@ -10,6 +10,7 @@
 #endif
 
 #include "intf.h"
+#include "timer.bpf.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -35,6 +36,7 @@ const volatile bool has_little_cores = true;
 const volatile bool disable_topology = false;
 const volatile bool xnuma_preemption = false;
 const volatile s32 __sibling_cpu[MAX_CPUS];
+const volatile bool monitor_disable = false;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
 const volatile u32 layer_iteration_order[MAX_LAYERS];
 
@@ -48,6 +50,7 @@ static u32 preempt_cursor;
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
 #include "util.bpf.c"
+
 
 UEI_DEFINE(uei);
 
@@ -1952,6 +1955,10 @@ void BPF_STRUCT_OPS(layered_exit_task, struct task_struct *p,
 	struct cpu_ctx *cctx;
 	struct task_ctx *tctx;
 
+	if(args->cancelled){
+		return;
+	}
+
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return;
 
@@ -2047,6 +2054,44 @@ void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 		     scx_bpf_dsq_nr_queued(LO_FALLBACK_DSQ),
 		     dsq_first_runnable_for_ms(LO_FALLBACK_DSQ, now));
 }
+
+
+/*
+ * Timer related setup
+ */
+
+static bool layered_monitor(void)
+{
+	if (monitor_disable)
+		return false;
+
+	// TODO: implement monitor
+
+	// always rerun the monitor
+	return true;
+}
+
+
+static bool run_timer_cb(int key)
+{
+	switch (key) {
+	case LAYERED_MONITOR:
+		return layered_monitor();
+	case NOOP_TIMER:
+	case MAX_TIMERS:
+	default:
+		return false;
+	}
+}
+
+struct layered_timer layered_timers[MAX_TIMERS] = {
+	{15LLU * NSEC_PER_SEC, CLOCK_BOOTTIME, 0},
+	{0LLU, CLOCK_BOOTTIME, 0},
+};
+
+// TODO: separate this out to a separate compilation unit
+#include "timer.bpf.c"
+
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 {
@@ -2241,6 +2286,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 			}
 		}
 	}
+	start_layered_timers();
 
 	return 0;
 }
