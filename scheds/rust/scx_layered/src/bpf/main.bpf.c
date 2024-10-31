@@ -51,7 +51,6 @@ static u32 preempt_cursor;
 
 #include "util.bpf.c"
 
-
 UEI_DEFINE(uei);
 
 static inline bool vtime_before(u64 a, u64 b)
@@ -356,6 +355,10 @@ static bool refresh_cpumasks(int idx)
 	trace("LAYER[%d] now has %d cpus, seq=%llu", idx, layer->nr_cpus, layer->cpus_seq);
 	return total > 0;
 }
+
+// TODO: Refactor includes that have circular dependencies. This import must be
+// defined after some helpers, but before it's helpers are used.
+#include "cost.bpf.c"
 
 SEC("fentry")
 int BPF_PROG(sched_tick_fentry)
@@ -775,6 +778,7 @@ bool try_preempt_cpu(s32 cand, struct task_struct *p, struct cpu_ctx *cctx,
 		     struct task_ctx *tctx, struct layer *layer,
 		     bool preempt_first)
 {
+	struct cost *cost;
 	struct cpu_ctx *cand_cctx, *sib_cctx = NULL;
 	s32 sib;
 
@@ -782,6 +786,9 @@ bool try_preempt_cpu(s32 cand, struct task_struct *p, struct cpu_ctx *cctx,
 		return false;
 
 	if (!(cand_cctx = lookup_cpu_ctx(cand)) || cand_cctx->current_preempt)
+		return false;
+
+	if (!(cost = lookup_cpu_cost(cand)) || has_budget(cost, layer) == 0)
 		return false;
 
 	/*
@@ -1202,16 +1209,17 @@ no:
 }
 
 static __noinline
-void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
+bool layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 {
 	struct cpu_ctx *cctx, *sib_cctx;
 	struct layer *layer;
+	struct cost *cost;
 	u64 dsq_id;
 	u32 idx, layer_idx;
 	s32 sib = sibling_cpu(cpu);
 
-	if (!(cctx = lookup_cpu_ctx(-1)))
-		return;
+	if (!(cctx = lookup_cpu_ctx(-1)) || !(cost = lookup_cpu_cost(cpu)))
+		return true;
 
 	/*
 	 * if @prev was on SCX and is still runnable, we are here because @prev
@@ -1226,7 +1234,7 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 	 * kernels, so let's make do with this for now.
 	 */
 	if (prev && keep_running(cctx, prev))
-		return;
+		return true;
 
 	/*
 	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
@@ -1236,132 +1244,115 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 	if (sib >= 0 && (sib_cctx = lookup_cpu_ctx(sib)) &&
 	    sib_cctx->current_exclusive) {
 		gstat_inc(GSTAT_EXCL_IDLE, cctx);
-		return;
+		return true;
 	}
 
 	/* consume preempting layers first */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(cost->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return true;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(cost, layer) == 0)
+			continue;
 		if (layer->preempt && scx_bpf_consume(layer_idx))
-			return;
+			return true;
 	}
 
 	dsq_id = cpu_hi_fallback_dsq_id(cpu);
 	if (scx_bpf_consume(dsq_id))
-		return;
+		return true;
 
 	/* consume !open layers second */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(cost->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return true;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(cost, layer) == 0)
+			continue;
 		struct cpumask *layer_cpumask;
 
 		/* consume matching layers */
 		if (!(layer_cpumask = lookup_layer_cpumask(layer_idx)))
-			return;
+			return true;
 
 		if (bpf_cpumask_test_cpu(cpu, layer_cpumask) ||
 		    (cpu == fallback_cpu && layer->nr_cpus == 0)) {
 			if (scx_bpf_consume(layer_idx))
-				return;
+				return true;
 		}
 	}
 
 	/* consume !preempting open layers */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(cost->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return true;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(cost, layer) == 0)
+			continue;
 		if (!layer->preempt && layers->open &&
 		    scx_bpf_consume(layer_idx))
-			return;
+			return true;
 	}
 
-	scx_bpf_consume(LO_FALLBACK_DSQ);
+	return scx_bpf_consume(LO_FALLBACK_DSQ);
 }
 
-void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
+int consume_preempting(struct cost *costc, u32 my_llc_id)
 {
-	if (disable_topology)
-		return layered_dispatch_no_topo(cpu, prev);
-
-	struct cpu_ctx *cctx, *sib_cctx;
 	struct layer *layer;
 	u64 dsq_id;
 	u32 idx, llc_idx, layer_idx;
-	s32 sib = sibling_cpu(cpu);
 
-	if (!(cctx = lookup_cpu_ctx(-1)))
-		return;
+	if (!costc)
+		return -EINVAL;
 
-	/*
-	 * if @prev was on SCX and is still runnable, we are here because @prev
-	 * has exhausted its slice. We may want to keep running it on this CPU
-	 * rather than giving this CPU to another task and then try to schedule
-	 * @prev somewhere else.
-	 *
-	 * Let's not dispatch any task if we want to keep running @prev. This
-	 * will trigger the automatic local enq behavior which will put @prev on
-	 * @cpu's local DSQ. A more straightforward way to implement this would
-	 * be extending slice from ops.tick() but that's not available in older
-	 * kernels, so let's make do with this for now.
-	 */
-	if (prev && keep_running(cctx, prev))
-		return;
-
-	/*
-	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
-	 * This test is a racy test but should be good enough for best-effort
-	 * optimization.
-	 */
-	if (sib >= 0 && (sib_cctx = lookup_cpu_ctx(sib)) &&
-	    sib_cctx->current_exclusive) {
-		gstat_inc(GSTAT_EXCL_IDLE, cctx);
-		return;
-	}
-
-	u32 my_llc_id = cpu_to_llc_id(cpu);
-
-	/* consume preempting layers first */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return -EINVAL;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(costc, layer) == 0)
+			continue;
 		bpf_for(llc_idx, 0, nr_llcs) {
 			u32 llc_id = rotate_llc_id(my_llc_id, llc_idx);
 			dsq_id = layer_dsq_id(layer_idx, llc_id);
 			if (layer->preempt && scx_bpf_consume(dsq_id))
-				return;
+				return 0;
 		}
 	}
 
-	dsq_id = cpu_hi_fallback_dsq_id(cpu);
-	if (scx_bpf_consume(dsq_id))
-		return;
+	return -ENOENT;
+}
 
-	/* consume !open layers second */
+int consume_non_open(struct cost *costc, s32 cpu, u32 my_llc_id)
+{
+	struct layer *layer;
+	u64 dsq_id;
+	u32 idx, llc_idx, layer_idx;
+
+	if (!costc)
+		return -EINVAL;
+
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return -EINVAL;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(costc, layer) == 0)
+			continue;
 		bpf_for(llc_idx, 0, nr_llcs) {
 			u32 llc_id = rotate_llc_id(my_llc_id, llc_idx);
 			struct cpumask *layer_cpumask;
@@ -1369,35 +1360,145 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 			/* consume matching layers */
 			if (!(layer_cpumask = lookup_layer_cpumask(layer_idx)))
-				return;
+				return 0;
 
 			if (bpf_cpumask_test_cpu(cpu, layer_cpumask) ||
 			    (cpu <= nr_possible_cpus && cpu == fallback_cpu &&
 			    layer->nr_cpus == 0)) {
 				if (scx_bpf_consume(dsq_id))
-					return;
+					return 0;
 			}
 		}
 	}
 
-	/* consume !preempting open layers */
+	return -ENOENT;
+}
+
+int consume_open_no_preempt(struct cost *costc, u32 my_llc_id)
+{
+	struct layer *layer;
+	u64 dsq_id;
+	u32 idx, llc_idx, layer_idx;
+
+	if (!costc)
+		return -EINVAL;
+
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cctx->layer_idx, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
-			return;
+			return -EINVAL;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
+		if (has_budget(costc, layer) == 0)
+			continue;
 		bpf_for(llc_idx, 0, nr_llcs) {
 			u32 llc_id = rotate_llc_id(my_llc_id, llc_idx);
 			dsq_id = layer_dsq_id(layer_idx, llc_id);
 
 			if (!layer->preempt && layer->open && scx_bpf_consume(dsq_id))
-				return;
+				return 0;
 		}
 	}
 
-	scx_bpf_consume(LO_FALLBACK_DSQ);
+	return -ENOENT;
+}
+
+static __always_inline
+bool layered_dispatch_topo(s32 cpu, struct task_struct *prev)
+{
+
+	struct cpu_ctx *cctx, *sib_cctx;
+	struct cost *costc;
+	u64 dsq_id;
+	s32 sib = sibling_cpu(cpu);
+
+	if (!(cctx = lookup_cpu_ctx(-1)) ||
+	    !(costc = lookup_cpu_cost(cpu)))
+		return true;
+
+	/*
+	 * if @prev was on SCX and is still runnable, we are here because @prev
+	 * has exhausted its slice. We may want to keep running it on this CPU
+	 * rather than giving this CPU to another task and then try to schedule
+	 * @prev somewhere else.
+	 *
+	 * Let's not dispatch any task if we want to keep running @prev. This
+	 * will trigger the automatic local enq behavior which will put @prev on
+	 * @cpu's local DSQ. A more straightforward way to implement this would
+	 * be extending slice from ops.tick() but that's not available in older
+	 * kernels, so let's make do with this for now.
+	 */
+	if (prev && keep_running(cctx, prev))
+		return true;
+
+	/*
+	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
+	 * This test is a racy test but should be good enough for best-effort
+	 * optimization.
+	 */
+	if (sib >= 0 && (sib_cctx = lookup_cpu_ctx(sib)) &&
+	    sib_cctx->current_exclusive) {
+		gstat_inc(GSTAT_EXCL_IDLE, cctx);
+		return true;
+	}
+
+	u32 my_llc_id = cpu_to_llc_id(cpu);
+
+	/* consume preempting layers first */
+	if (consume_preempting(costc, my_llc_id) == 0)
+		return true;
+
+	dsq_id = cpu_hi_fallback_dsq_id(cpu);
+	if (scx_bpf_consume(dsq_id))
+		return true;
+
+	/* consume !open layers second */
+	if (consume_non_open(costc, cpu, my_llc_id) == 0)
+		return true;
+
+	/* consume !preempting open layers */
+	if (consume_open_no_preempt(costc, my_llc_id) == 0)
+		return true;
+
+	return scx_bpf_consume(LO_FALLBACK_DSQ);
+}
+
+void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
+{
+	if (disable_topology) {
+		if (layered_dispatch_no_topo(cpu, prev))
+			return;
+	} else {
+		if (layered_dispatch_topo(cpu, prev))
+			return;
+	}
+
+	// We were unable to schedule within existing budget constraints.
+	// Acquire more budget from the global stores and try again.
+	acquire_budgets();
+
+	if (disable_topology) {
+		if (layered_dispatch_no_topo(cpu, prev))
+			return;
+	} else {
+		if (layered_dispatch_topo(cpu, prev))
+			return;
+	}
+
+	// We couldn't schedule anything. Check if this is because there was no
+	// global budget or because we have nothing to schedule.
+	if (all_layers_have_local_budget())
+		return;
+
+	refresh_budgets();
+	if (disable_topology) {
+		if (layered_dispatch_no_topo(cpu, prev))
+			return;
+	} else {
+		if (layered_dispatch_topo(cpu, prev))
+			return;
+	}
 }
 
 static __noinline bool match_one(struct layer_match *match,
@@ -1800,6 +1901,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	struct cpu_ctx *cctx;
 	struct task_ctx *tctx;
 	struct layer *layer;
+	struct cost *cost;
 	s32 lidx;
 	u64 used;
 
@@ -1807,7 +1909,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	lidx = tctx->layer;
-	if (!(layer = lookup_layer(lidx)))
+	if (!(layer = lookup_layer(lidx)) || !(cost = lookup_cpu_cost(-1)))
 		return;
 
 	used = bpf_ktime_get_ns() - tctx->running_at;
@@ -1817,6 +1919,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		used = layer->min_exec_ns;
 	}
 
+	record_cpu_cost(cost, layer->idx, (s64)used);
 	cctx->layer_cycles[lidx] += used;
 	cctx->current_preempt = false;
 	cctx->prev_exclusive = cctx->current_exclusive;
@@ -2286,7 +2389,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 			}
 		}
 	}
-	start_layered_timers();
+	initialize_budgets(1000LLU * NSEC_PER_MSEC);
+	ret = start_layered_timers();
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }

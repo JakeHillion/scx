@@ -263,7 +263,7 @@ static u64 calc_freq_factor(u64 freq, u64 weight_ft)
 }
 
 static u64 calc_weight_factor(struct task_struct *p, struct task_ctx *taskc,
-			      struct cpu_ctx *cpuc_cur, u64 enq_flags)
+			      u64 enq_flags)
 {
 	u64 weight_boost = 1;
 	u64 weight_ft;
@@ -283,10 +283,10 @@ static u64 calc_weight_factor(struct task_struct *p, struct task_ctx *taskc,
 		weight_boost += LAVD_LC_WEIGHT_BOOST;
 
 	/*
-	 * Reset task's lock and futex boost count
-	 * for a lock holder to be boosted only once.
+	 * A pinned-task tends to be latency-critical.
 	 */
-	reset_lock_futex_boost(taskc, cpuc_cur);
+	if (p->nr_cpus_allowed == 1)
+		weight_boost += LAVD_LC_WEIGHT_BOOST;
 
 	/*
 	 * Prioritize a lock holder for faster system-wide forward progress.
@@ -301,7 +301,7 @@ static u64 calc_weight_factor(struct task_struct *p, struct task_ctx *taskc,
 }
 
 static u64 calc_lat_cri(struct task_struct *p, struct task_ctx *taskc,
-			struct cpu_ctx *cpuc_cur, u64 enq_flags)
+			u64 enq_flags)
 {
 	u64 weight_ft, wait_freq_ft, wake_freq_ft, runtime_ft;
 	u64 lat_cri;
@@ -310,7 +310,7 @@ static u64 calc_lat_cri(struct task_struct *p, struct task_ctx *taskc,
 	 * Adjust task's weight based on the scheduling context, such as
 	 * if it is a kernel task, lock holder, etc.
 	 */
-	weight_ft = calc_weight_factor(p, taskc, cpuc_cur, enq_flags);
+	weight_ft = calc_weight_factor(p, taskc, enq_flags);
 
 	/*
 	 * A task is more latency-critical as its wait or wake frequencies
@@ -355,7 +355,6 @@ static u64 calc_lat_cri(struct task_struct *p, struct task_ctx *taskc,
 
 static void calc_virtual_deadline_delta(struct task_struct *p,
 					struct task_ctx *taskc,
-					struct cpu_ctx *cpuc_cur,
 					u64 enq_flags)
 {
 	u64 deadline, lat_cri;
@@ -364,7 +363,7 @@ static void calc_virtual_deadline_delta(struct task_struct *p,
 	/*
 	 * Calculate the deadline based on latency criticality and greedy ratio.
 	 */
-	lat_cri = calc_lat_cri(p, taskc, cpuc_cur, enq_flags);
+	lat_cri = calc_lat_cri(p, taskc, enq_flags);
 	greedy_ratio = calc_greedy_ratio(taskc);
 	greedy_ft = calc_greedy_factor(greedy_ratio);
 
@@ -448,8 +447,7 @@ static u64 get_suspended_duration_and_reset(struct cpu_ctx *cpuc)
 }
 
 static void update_stat_for_runnable(struct task_struct *p,
-				     struct task_ctx *taskc,
-				     struct cpu_ctx *cpuc)
+				     struct task_ctx *taskc)
 {
 	/*
 	 * Reflect task's load immediately.
@@ -515,10 +513,12 @@ static void update_stat_for_running(struct task_struct *p,
 	cpuc->sum_lat_cri += taskc->lat_cri;
 	cpuc->nr_sched++;
 
+
 	/*
-	 * Update lock holder information on the cpu.
+	 * Reset task's lock and futex boost count
+	 * for a lock holder to be boosted only once.
 	 */
-	cpuc->lock_holder = is_lock_holder(taskc);
+	reset_lock_futex_boost(taskc, cpuc);
 
 	/*
 	 * It is clear there is no need to consider the suspended duration
@@ -938,12 +938,26 @@ static void update_task_log_clk(struct task_ctx *taskc)
 	WRITE_ONCE(taskc->vdeadline_log_clk, vlc);
 }
 
-static void direct_dispatch(struct task_struct *p, struct task_ctx *taskc)
+static void direct_dispatch(struct task_struct *p, struct task_ctx *taskc,
+			    u64 enq_flags)
 {
+	/*
+	 * Calculate latency criticality for preemptability test.
+	 */
+	calc_lat_cri(p, taskc, 0);
+
+	/*
+	 * Reset the vdeadline_delta_ns to update the task's logical clock.
+	 */
 	taskc->vdeadline_delta_ns = 0;
 	update_task_log_clk(taskc);
+
+	/*
+	 * Calculate the duration to run.
+	 */
 	p->scx.slice = calc_time_slice(p, taskc);
-	scx_bpf_dispatch(p, SCX_DSQ_LOCAL, p->scx.slice, 0);
+
+	scx_bpf_dispatch(p, SCX_DSQ_LOCAL, p->scx.slice, enq_flags);
 }
 
 s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
@@ -956,26 +970,32 @@ s32 BPF_STRUCT_OPS(lavd_select_cpu, struct task_struct *p, s32 prev_cpu,
 	taskc = get_task_ctx(p);
 	if (!taskc)
 		return prev_cpu;
+	taskc->wakeup_ft += !!(wake_flags & SCX_WAKE_SYNC);
 
 	cpu_id = pick_idle_cpu(p, taskc, prev_cpu, wake_flags, &found_idle);
 	if (found_idle) {
-		direct_dispatch(p, taskc);
+		/*
+		 * If there is an idle cpu,
+		 * disptach the task to the idle cpu right now.
+		 */
+		direct_dispatch(p, taskc, 0);
 		return cpu_id;
 	}
 
-	taskc->wakeup_ft += !!(wake_flags & SCX_WAKE_SYNC);
-
+	/*
+	 * Even if there is no idle cpu, still repect the chosen cpu.
+	 */
 	return cpu_id >= 0 ? cpu_id : prev_cpu;
 }
 
 static void calc_when_to_run(struct task_struct *p, struct task_ctx *taskc,
-			     struct cpu_ctx *cpuc_cur, u64 enq_flags)
+			     u64 enq_flags)
 {
 	/*
 	 * Before enqueueing a task to a run queue, we should decide when a
 	 * task should be scheduled.
 	 */
-	calc_virtual_deadline_delta(p, taskc, cpuc_cur, enq_flags);
+	calc_virtual_deadline_delta(p, taskc, enq_flags);
 
 	update_task_log_clk(taskc);
 }
@@ -999,15 +1019,19 @@ static u64 find_proper_dsq(struct task_ctx *taskc, struct cpu_ctx *cpuc)
 	return cpuc->cpdom_alt_id;
 }
 
-static void kick_task_cpu(struct task_struct *p, struct task_ctx *taskc)
+static bool try_kick_task_idle_cpu(struct task_struct *p, struct task_ctx *taskc)
 {
 	bool found_idle = false;
 	s32 prev_cpu, cpu;
 
 	prev_cpu = scx_bpf_task_cpu(p);
 	cpu = pick_idle_cpu(p, taskc, prev_cpu, 0, &found_idle);
-	if (found_idle && cpu >= 0)
+	if (found_idle && cpu >= 0) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		return true;
+	}
+
+	return false;
 }
 
 void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
@@ -1016,6 +1040,7 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *taskc;
 	s32 cpu_id;
 	u64 dsq_id;
+	bool preempted = false, yield;
 
 	/*
 	 * Place a task to a run queue of current cpu's compute domain.
@@ -1037,33 +1062,9 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 
 	/*
 	 * Calculate when a tack can be scheduled.
-	 *
-	 * Note that the task's time slice will be calculated and reassigned
-	 * right before running at ops.running().
 	 */
-	calc_when_to_run(p, taskc, cpuc_cur, enq_flags);
+	calc_when_to_run(p, taskc, enq_flags);
 	dsq_id = find_proper_dsq(taskc, cpuc_task);
-
-	/*
-	 * If a task is eligible, try to preempt a task.
-	 */
-	if (is_eligible(taskc)) {
-		struct task_ctx *taskc_run;
-		struct task_struct *p_run;
-		/*
-		 * Try to find and kick a victim CPU, which runs a less urgent
-		 * task. The kick will be done asynchronously.
-		 */
-		try_find_and_kick_victim_cpu(p, taskc, cpuc_cur, dsq_id);
-
-		/*
-		 * If the current task has something to yield, try preempt it.
-		 */
-		p_run = bpf_get_current_task_btf();
-		taskc_run = try_get_task_ctx(p_run);
-		if (taskc_run && p_run->scx.slice != 0)
-			try_yield_current_cpu(p_run, cpuc_cur, taskc_run);
-	}
 
 	/*
 	 * Calculate the task's time slice.
@@ -1074,13 +1075,43 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Enqueue the task to one of task's DSQs based on its virtual deadline.
 	 */
 	scx_bpf_dispatch_vtime(p, dsq_id, p->scx.slice,
-			       taskc->vdeadline_log_clk, enq_flags);
+		 taskc->vdeadline_log_clk, enq_flags);
 
 	/*
-	 * If there is an idle cpu for the task, kick it up now
+	 * If there is an idle cpu for the task, try to kick it up now
 	 * so it can consume the task immediately.
 	 */
-	kick_task_cpu(p, taskc);
+	if (try_kick_task_idle_cpu(p, taskc))
+		return;
+
+	/*
+	 * If there is no idle cpu for an eligible task, try to preempt a task.
+	 */
+	if (is_eligible(taskc)) {
+		/*
+		 * Try to find and kick a victim CPU, which runs a less urgent
+		 * task. The kick will be done asynchronously.
+		 */
+		preempted = try_find_and_kick_victim_cpu(p, taskc, cpuc_cur, dsq_id);
+	}
+
+	/*
+	 * If the current ineligible task has something to yield,
+	 * try preempt it.
+	 */
+	if (!preempted) {
+		struct task_ctx *taskc_run;
+		struct task_struct *p_run;
+
+		p_run = bpf_get_current_task_btf();
+		taskc_run = try_get_task_ctx(p_run);
+
+		if (taskc_run && !is_eligible(taskc_run)) {
+			yield = try_yield_current_cpu(p_run, cpuc_cur, taskc_run);
+			if (yield)
+				try_kick_cpu(cpuc_cur, cpuc_cur->last_kick_clk);
+		}
+	}
 }
 
 static bool consume_dsq(s32 cpu, u64 dsq_id, u64 now)
@@ -1209,7 +1240,7 @@ void BPF_STRUCT_OPS(lavd_dispatch, s32 cpu, struct task_struct *prev)
 
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
-		scx_bpf_error("Failed to look up cpu context or task context");
+		scx_bpf_error("Failed to look up cpu context context");
 		return;
 	}
 
@@ -1361,6 +1392,11 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p_run)
 	struct task_ctx *taskc_run;
 	bool preempted = false;
 
+	/*
+	 * If a task is eligible, don't consider its being preempted.
+	 */
+	if (is_eligible(p_run))
+		goto update_cpuperf;
 
 	/*
 	 * Try to yield the current CPU if there is a higher priority task in
@@ -1369,22 +1405,28 @@ void BPF_STRUCT_OPS(lavd_tick, struct task_struct *p_run)
 	cpuc_run = get_cpu_ctx();
 	taskc_run = get_task_ctx(p_run);
 	if (!cpuc_run || !taskc_run)
-		goto freq_out;
+		goto update_cpuperf;
 
 	preempted = try_yield_current_cpu(p_run, cpuc_run, taskc_run);
 
 	/*
+	 * If decided to yield, give up its time slice.
+	 */
+	if (preempted) {
+		p_run->scx.slice = 0;
+	}
+	/*
 	 * Update performance target of the current CPU if the current running
 	 * task continues to run.
 	 */
-freq_out:
-	if (!preempted)
+	else {
+update_cpuperf:
 		try_decrease_cpuperf_target(cpuc_run);
+	}
 }
 
 void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 {
-	struct cpu_ctx *cpuc;
 	struct task_struct *waker;
 	struct task_ctx *p_taskc, *waker_taskc;
 	u64 now, interval;
@@ -1394,12 +1436,11 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	 * rq. Statistics will be adjusted when more accurate statistics become
 	 * available (ops.running).
 	 */
-	cpuc = get_cpu_ctx();
 	p_taskc = get_task_ctx(p);
-	if (!cpuc || !p_taskc)
+	if (!p_taskc)
 		return;
 
-	update_stat_for_runnable(p, p_taskc, cpuc);
+	update_stat_for_runnable(p, p_taskc);
 
 	/*
 	 * When a task @p is wakened up, the wake frequency of its waker task
