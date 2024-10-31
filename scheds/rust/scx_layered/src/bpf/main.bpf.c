@@ -39,6 +39,7 @@ const volatile s32 __sibling_cpu[MAX_CPUS];
 const volatile bool monitor_disable = false;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
 const volatile u32 layer_iteration_order[MAX_LAYERS];
+const volatile u64 layer_llc_latency_update_delay_ns = 10 * NSEC_PER_MSEC;
 
 private(all_cpumask) struct bpf_cpumask __kptr *all_cpumask;
 private(big_cpumask) struct bpf_cpumask __kptr *big_cpumask;
@@ -215,6 +216,55 @@ static struct cache_ctx *lookup_cache_ctx(u32 cache_idx)
 
 	cachec = bpf_map_lookup_elem(&cache_data, &cache_idx);
 	return cachec;
+}
+
+struct layer_latencies {
+	u64 local[MAX_LAYERS];
+	u64 remote[MAX_LLCS][MAX_LAYERS];
+	u64 last_updated_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct layer_latencies);
+	__uint(max_entries, MAX_LAYERS);
+} layer_latencies_map SEC(".maps");
+
+static struct layer_latencies *lookup_layer_latencies(int cpu)
+{
+	struct layer_latencies *lats;
+	u32 zero = 0;
+
+	if (cpu < 0)
+		lats = bpf_map_lookup_elem(&layer_latencies_map, &zero);
+	else
+		lats = bpf_map_lookup_percpu_elem(&layer_latencies_map, &zero, cpu);
+
+	if (!lats)
+		scx_bpf_error("no layer_latencies for cpu %d", cpu);
+	return lats;
+}
+
+static void update_llc_latencies(struct layer_latencies *lats, struct cache_ctx *cctx)
+{
+	// TODO
+}
+
+static void maybe_update_llc_latencies(struct layer_latencies *lats)
+{
+	struct cache_ctx *cctx;
+	u64 now = bpf_ktime_get_ns();
+
+	if (lats->last_updated_ns + layer_llc_latency_update_delay_ns < now) {
+		update_llc_latencies();
+		return;
+	}
+
+	u32 llc_idx;
+	bpf_for(llc_idx, 0, nr_llcs) {
+		update_llc_latencies
+	}
 }
 
 static void gstat_inc(enum global_stat_idx idx, struct cpu_ctx *cctx)
@@ -1233,8 +1283,12 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 	 * be extending slice from ops.tick() but that's not available in older
 	 * kernels, so let's make do with this for now.
 	 */
-	if (prev && keep_running(cctx, prev))
+	if (prev && keep_running(cctx, prev)) {
+		// TODO: do we need to acknowledge this event as a 0-latency 
+		// runnable/running? I think we probably do, assuming this code
+		// path leads to `running` being called.
 		return;
+	}
 
 	/*
 	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
@@ -1866,6 +1920,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	struct task_ctx *tctx;
 	struct layer *layer;
 	struct cost *cost;
+	struct layer_latencies *latencies;
 	s32 lidx;
 	u64 used;
 
@@ -1875,6 +1930,8 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	lidx = tctx->layer;
 	if (!(layer = lookup_layer(lidx)) || !(cost = lookup_cpu_cost(-1)))
 		return;
+	if (!(latencies = lookup_layer_latencies(-1)))
+		return;
 
 	used = bpf_ktime_get_ns() - tctx->running_at;
 	if (used < layer->min_exec_ns) {
@@ -1882,6 +1939,9 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		lstat_add(LSTAT_MIN_EXEC_NS, layer, cctx, layer->min_exec_ns - used);
 		used = layer->min_exec_ns;
 	}
+
+	u64 scheduling_latency = tctx->running_at - tctx->runnable_at;
+	latencies->latencies[lidx] = (latencies->latencies[lidx] * 15 / 16 + scheduling_latency / 16);
 
 	record_cpu_cost(cost, layer->idx, (s64)used);
 	cctx->layer_cycles[lidx] += used;
