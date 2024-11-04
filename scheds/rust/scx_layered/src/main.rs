@@ -97,6 +97,8 @@ lazy_static::lazy_static! {
 			idle_smt: false,
                         slice_us: 20000,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        steal_minimum_abs_ns: 0,
+                        steal_minimum_rel: 0,
                         growth_algo: LayerGrowthAlgo::Sticky,
 			perf: 1024,
 			nodes: vec![],
@@ -119,6 +121,8 @@ lazy_static::lazy_static! {
 			idle_smt: false,
                         slice_us: 20000,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        steal_minimum_abs_ns: 0,
+                        steal_minimum_rel: 0,
                         growth_algo: LayerGrowthAlgo::Sticky,
 			perf: 1024,
 			nodes: vec![],
@@ -145,6 +149,8 @@ lazy_static::lazy_static! {
 			idle_smt: false,
                         slice_us: 800,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        steal_minimum_abs_ns: 0,
+                        steal_minimum_rel: 0,
                         growth_algo: LayerGrowthAlgo::Topo,
 			perf: 1024,
 			nodes: vec![],
@@ -166,6 +172,8 @@ lazy_static::lazy_static! {
 			idle_smt: false,
                         slice_us: 20000,
                         weight: DEFAULT_LAYER_WEIGHT,
+                        steal_minimum_abs_ns: 0,
+                        steal_minimum_rel: 0,
                         growth_algo: LayerGrowthAlgo::Linear,
 			perf: 1024,
 			nodes: vec![],
@@ -1288,6 +1296,8 @@ impl<'a> Scheduler<'a> {
                     nodes,
                     slice_us,
                     weight,
+                    steal_minimum_abs_ns,
+                    steal_minimum_rel,
                     ..
                 }
                 | LayerKind::Grouped {
@@ -1302,6 +1312,8 @@ impl<'a> Scheduler<'a> {
                     nodes,
                     slice_us,
                     weight,
+                    steal_minimum_abs_ns,
+                    steal_minimum_rel,
                     ..
                 }
                 | LayerKind::Open {
@@ -1316,6 +1328,8 @@ impl<'a> Scheduler<'a> {
                     nodes,
                     slice_us,
                     weight,
+                    steal_minimum_abs_ns,
+                    steal_minimum_rel,
                     ..
                 } => {
                     layer.slice_ns = if *slice_us > 0 {
@@ -1344,6 +1358,8 @@ impl<'a> Scheduler<'a> {
                     } else {
                         DEFAULT_LAYER_WEIGHT
                     };
+                    layer.steal_minimum_abs_ns = *steal_minimum_abs_ns;
+                    layer.steal_minimum_rel = *steal_minimum_rel;
                     layer_weights.push(layer.weight.try_into().unwrap());
                     layer.perf = u32::try_from(*perf)?;
                     layer.node_mask = nodemask_from_nodes(nodes) as u64;

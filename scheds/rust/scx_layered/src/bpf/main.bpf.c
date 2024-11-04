@@ -39,6 +39,7 @@ const volatile s32 __sibling_cpu[MAX_CPUS];
 const volatile bool monitor_disable = false;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
 const volatile u32 layer_iteration_order[MAX_LAYERS];
+const volatile u64 layer_llc_latency_update_delay_ns = 10 * NSEC_PER_MSEC;
 
 private(all_cpumask) struct bpf_cpumask __kptr *all_cpumask;
 private(big_cpumask) struct bpf_cpumask __kptr *big_cpumask;
@@ -215,6 +216,92 @@ static struct cache_ctx *lookup_cache_ctx(u32 cache_idx)
 
 	cachec = bpf_map_lookup_elem(&cache_data, &cache_idx);
 	return cachec;
+}
+
+struct layer_latencies {
+	u64 local[MAX_LAYERS];
+	u64 aggr[MAX_LLCS][MAX_LAYERS];
+	u64 last_updated_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, struct layer_latencies);
+	__uint(max_entries, MAX_LAYERS);
+} layer_latencies_map SEC(".maps");
+
+static struct layer_latencies *lookup_layer_latencies(int cpu)
+{
+	struct layer_latencies *lats;
+	u32 zero = 0;
+
+	if (cpu < 0)
+		lats = bpf_map_lookup_elem(&layer_latencies_map, &zero);
+	else
+		lats = bpf_map_lookup_percpu_elem(&layer_latencies_map, &zero, cpu);
+
+	if (!lats)
+		scx_bpf_error("no layer_latencies for cpu %d", cpu);
+	return lats;
+}
+
+/*
+ * Update local LLC's average latency and update local LLC's view of remote
+ * latencies if they are stale by layer_llc_latency_update_delay_ns.
+ */
+u32 maybe_update_llc_latencies(u32 my_llc_id)
+{
+	struct cpu_ctx *cpuc;
+	struct layer_latencies *lats, *remotes;
+	struct cache_ctx *cachec;
+	u32 llc_idx, layer_idx, cpu_idx;
+	u64 now = bpf_ktime_get_ns();
+
+	lats = lookup_layer_latencies(-1);
+	if (!lats)
+		return 0;
+
+	bool update_remote = lats->last_updated_ns + layer_llc_latency_update_delay_ns < now;
+
+	if (update_remote) {
+		bpf_for(llc_idx, 0, MAX_LLCS) {
+			bpf_for(layer_idx, 0, MAX_LAYERS) {
+				lats->aggr[llc_idx][layer_idx] = 0;
+			}
+		}
+	} else {
+		if (my_llc_id >= MAX_LLCS) {
+			scx_bpf_error("invalid llc_id provided: %u", my_llc_id);
+			return 0;
+		}
+		bpf_for(layer_idx, 0, MAX_LAYERS) {
+			lats->aggr[my_llc_id][layer_idx] = 0;
+		}
+	}
+	bpf_for(cpu_idx, 0, scx_bpf_nr_cpu_ids()) {
+		cpuc = lookup_cpu_ctx(cpu_idx);
+		if (!cpuc)
+			continue;
+		if ((llc_idx = cpuc->cache_idx) >= MAX_LLCS)
+			continue;
+		if (!update_remote && llc_idx != my_llc_id)
+			continue;
+
+		remotes = lookup_layer_latencies(cpu_idx);
+		cachec = lookup_cache_ctx(llc_idx);
+		if (!cachec || !remotes)
+			continue;
+
+		bpf_for(layer_idx, 0, MAX_LAYERS) {
+			lats->aggr[llc_idx][layer_idx] +=
+			 	*MEMBER_VPTR(remotes->local, [layer_idx]) / cachec->nr_cpus;
+		}
+	}
+
+	if (update_remote)
+		lats->last_updated_ns = now;
+	return 0;
 }
 
 static void gstat_inc(enum global_stat_idx idx, struct cpu_ctx *cctx)
@@ -1233,8 +1320,9 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 	 * be extending slice from ops.tick() but that's not available in older
 	 * kernels, so let's make do with this for now.
 	 */
-	if (prev && keep_running(cctx, prev))
+	if (prev && keep_running(cctx, prev)) {
 		return;
+	}
 
 	/*
 	 * If the sibling CPU is running an exclusive task, keep this CPU idle.
@@ -1306,6 +1394,40 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 	scx_bpf_consume(LO_FALLBACK_DSQ);
 }
 
+bool should_work_steal(u32 layer_idx, u32 dst_llc_idx, u32 src_llc_idx)
+{
+	if (dst_llc_idx == src_llc_idx)
+		return true;
+
+	dst_llc_idx = (u32)(((u64)dst_llc_idx) & 0xfff);
+	src_llc_idx = (u32)(((u64)src_llc_idx) & 0xfff);
+
+	struct layer_latencies *lats;
+	struct layer *layer;
+	u64 dst_latency, src_latency, delta;
+
+	if (layer_idx >= nr_layers)
+		return true;
+	layer = MEMBER_VPTR(layers, [layer_idx]);
+
+	if (!(lats = lookup_layer_latencies(-1)))
+		return true;
+
+	if (dst_llc_idx >= nr_llcs || src_llc_idx >= nr_llcs)
+		return true;
+
+	dst_latency = lats->aggr[dst_llc_idx][layer_idx];
+	src_latency = lats->aggr[src_llc_idx][layer_idx];
+
+	if (dst_latency > src_latency)
+		return true;
+
+	delta = dst_latency - src_latency;
+
+	return delta > layer->steal_minimum_abs_ns &&
+		delta > (dst_latency * layer->steal_minimum_rel) / 1024;
+}
+
 int consume_preempting(struct cost *costc, u32 my_llc_id)
 {
 	struct layer *layer;
@@ -1324,10 +1446,11 @@ int consume_preempting(struct cost *costc, u32 my_llc_id)
 		layer = MEMBER_VPTR(layers, [layer_idx]);
 		if (has_budget(costc, layer) == 0)
 			continue;
+
 		bpf_for(llc_idx, 0, nr_llcs) {
 			u32 llc_id = rotate_llc_id(my_llc_id, llc_idx);
 			dsq_id = layer_dsq_id(layer_idx, llc_id);
-			if (layer->preempt && scx_bpf_consume(dsq_id))
+			if (layer->preempt && should_work_steal(layer_idx, my_llc_id, llc_id) && scx_bpf_consume(dsq_id))
 				return 0;
 		}
 	}
@@ -1335,13 +1458,14 @@ int consume_preempting(struct cost *costc, u32 my_llc_id)
 	return -ENOENT;
 }
 
+static __always_inline
 int consume_non_open(struct cost *costc, s32 cpu, u32 my_llc_id)
 {
 	struct layer *layer;
 	u64 dsq_id;
 	u32 idx, llc_idx, layer_idx;
 
-	if (!costc)
+	if (!costc || my_llc_id >= MAX_LLCS)
 		return -EINVAL;
 
 	bpf_for(idx, 0, nr_layers) {
@@ -1365,7 +1489,7 @@ int consume_non_open(struct cost *costc, s32 cpu, u32 my_llc_id)
 			if (bpf_cpumask_test_cpu(cpu, layer_cpumask) ||
 			    (cpu <= nr_possible_cpus && cpu == fallback_cpu &&
 			    layer->nr_cpus == 0)) {
-				if (scx_bpf_consume(dsq_id))
+				if (should_work_steal(layer_idx, my_llc_id, llc_id) && scx_bpf_consume(dsq_id))
 					return 0;
 			}
 		}
@@ -1380,7 +1504,7 @@ int consume_open_no_preempt(struct cost *costc, u32 my_llc_id)
 	u64 dsq_id;
 	u32 idx, llc_idx, layer_idx;
 
-	if (!costc)
+	if (!costc || my_llc_id >= MAX_LLCS)
 		return -EINVAL;
 
 	bpf_for(idx, 0, nr_layers) {
@@ -1396,7 +1520,7 @@ int consume_open_no_preempt(struct cost *costc, u32 my_llc_id)
 			u32 llc_id = rotate_llc_id(my_llc_id, llc_idx);
 			dsq_id = layer_dsq_id(layer_idx, llc_id);
 
-			if (!layer->preempt && layer->open && scx_bpf_consume(dsq_id))
+			if (!layer->preempt && layer->open && should_work_steal(layer_idx, my_llc_id, llc_id) && scx_bpf_consume(dsq_id))
 				return 0;
 		}
 	}
@@ -1457,6 +1581,7 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	u32 my_llc_id = cpu_to_llc_id(cpu);
+	maybe_update_llc_latencies(my_llc_id);	// TODO: this runs too frequently. It will update the local LLC every single invocation which isn't free. We could time limit this, but the better approach is to update that every time it matters, so running this within the first foreign LLC invocation in consume_preempting.
 
 	/* consume preempting layers first */
 	if (consume_preempting(costc, my_llc_id) == 0)
@@ -1878,6 +2003,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	struct task_ctx *tctx;
 	struct layer *layer;
 	struct cost *costc;
+	struct layer_latencies *latencies;
 	s32 lidx;
 	u64 used;
 
@@ -1887,6 +2013,8 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	lidx = tctx->layer;
 	if (!(layer = lookup_layer(lidx)) || !(costc = lookup_cpu_cost(-1)))
 		return;
+	if (!(latencies = lookup_layer_latencies(-1)))
+		return;
 
 	used = bpf_ktime_get_ns() - tctx->running_at;
 	if (used < layer->min_exec_ns) {
@@ -1894,6 +2022,9 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		lstat_add(LSTAT_MIN_EXEC_NS, layer, cctx, layer->min_exec_ns - used);
 		used = layer->min_exec_ns;
 	}
+
+	u64 scheduling_latency = tctx->running_at - tctx->runnable_at;
+	latencies->local[lidx] = (latencies->local[lidx] * 15 / 16 + scheduling_latency / 16);
 
 	record_cpu_cost(costc, layer->idx, (s64)used);
 	cctx->layer_cycles[lidx] += used;

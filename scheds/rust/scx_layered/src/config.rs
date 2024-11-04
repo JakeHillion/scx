@@ -94,6 +94,10 @@ pub enum LayerKind {
         #[serde(default)]
         weight: u32,
         #[serde(default)]
+        steal_minimum_abs_ns: u64,
+        #[serde(default)]
+        steal_minimum_rel: u32,
+        #[serde(default)]
         idle_smt: bool,
         #[serde(default)]
         growth_algo: LayerGrowthAlgo,
@@ -123,6 +127,10 @@ pub enum LayerKind {
         #[serde(default)]
         weight: u32,
         #[serde(default)]
+        steal_minimum_abs_ns: u64,
+        #[serde(default)]
+        steal_minimum_rel: u32,
+        #[serde(default)]
         idle_smt: bool,
         #[serde(default)]
         growth_algo: LayerGrowthAlgo,
@@ -148,6 +156,10 @@ pub enum LayerKind {
         exclusive: bool,
         #[serde(default)]
         weight: u32,
+        #[serde(default)]
+        steal_minimum_abs_ns: u64,
+        #[serde(default)]
+        steal_minimum_rel: u32,
         #[serde(default)]
         idle_smt: bool,
         #[serde(default)]
