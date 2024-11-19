@@ -115,15 +115,15 @@ u32 rotate_llc_id(u32 base_llc_id, u32 rotation)
 // return the dsq id for the layer based on the LLC id.
 static __noinline u64 layer_dsq_id(u32 layer_id, u32 llc_id)
 {
-	return (layer_id * nr_llcs) + llc_id;
+	if (nr_llcs == 1)
+		return layer_id;
+	else
+		return (layer_id * nr_llcs) + llc_id;
 }
 
-// XXX - cpu_to_llc_id() must not be inlined to not blow past ins limit when
-// topo is enabled but older kernels get confused by RCU state when subprogs are
-// called from sleepable functions. Use __always_inline variant from
-// layered_init() and __noinline from everywhere else. Remove this once we can
-// ignore the older kernels.
-static __always_inline u32 __cpu_to_llc_id(s32 cpu_id)
+// XXX - older kernels get confused by RCU state when subprogs are called from
+// sleepable functions. Use __always_inline.
+static __always_inline u32 cpu_to_llc_id(s32 cpu_id)
 {
         const volatile u32 *llc_ptr;
 
@@ -133,11 +133,6 @@ static __always_inline u32 __cpu_to_llc_id(s32 cpu_id)
                 return 0;
         }
         return *llc_ptr;
-}
-
-static __noinline u32 cpu_to_llc_id(u32 cpu_id)
-{
-	return __cpu_to_llc_id(cpu_id);
 }
 
 u32 llc_node_id(u32 llc_id)
@@ -160,33 +155,6 @@ static u64 llc_hi_fallback_dsq_id(u32 llc_id)
 static inline bool is_fallback_dsq(u64 dsq_id)
 {
 	return dsq_id > HI_FALLBACK_DSQ_BASE && dsq_id <= LO_FALLBACK_DSQ;
-}
-
-static u64 llc_hi_fallback_dsq_iter_offset(int llc_offset, int idx)
-{
-	int offset = llc_offset + idx;
-
-	if (offset >= nr_llcs)
-		return llc_hi_fallback_dsq_id(offset - nr_llcs);
-
-	return llc_hi_fallback_dsq_id(idx + llc_offset);
-}
-
-static int llc_iter_cpu_offset(int idx, s32 cpu)
-{
-	int offset;
-
-	if (cpu <= 0)
-		return idx;
-
-	offset = (cpu % nr_llcs) + idx;
-
-	return offset >= nr_llcs ? offset - nr_llcs : offset;
-}
-
-static u64 cpu_hi_fallback_dsq_id(s32 cpu)
-{
-	return llc_hi_fallback_dsq_id(cpu_to_llc_id(cpu));
 }
 
 struct {
@@ -226,7 +194,8 @@ static struct node_ctx *lookup_node_ctx(u32 node)
 {
 	struct node_ctx *nodec;
 
-	nodec = bpf_map_lookup_elem(&node_data, &node);
+	if (!(nodec = bpf_map_lookup_elem(&node_data, &node)))
+		scx_bpf_error("no node_ctx");
 	return nodec;
 }
 
@@ -242,7 +211,8 @@ static struct cache_ctx *lookup_cache_ctx(u32 cache_idx)
 {
 	struct cache_ctx *cachec;
 
-	cachec = bpf_map_lookup_elem(&cache_data, &cache_idx);
+	if (!(cachec = bpf_map_lookup_elem(&cache_data, &cache_idx)))
+		scx_bpf_error("no cache_ctx");
 	return cachec;
 }
 
@@ -325,7 +295,7 @@ static struct cpumask *lookup_layer_cpumask(int idx)
 	struct layer_cpumask_wrapper *cpumaskw;
 
 	if ((cpumaskw = bpf_map_lookup_elem(&layer_cpumasks, &idx))) {
-		return cast_mask(cpumaskw->cpumask);
+		return (struct cpumask *)cpumaskw->cpumask;
 	} else {
 		scx_bpf_error("no layer_cpumask");
 		return NULL;
@@ -400,15 +370,26 @@ int BPF_PROG(sched_tick_fentry)
 	return 0;
 }
 
+struct cached_cpus {
+	s64			id;
+	u64			seq;
+};
+
 struct task_ctx {
 	int			pid;
 	int			last_cpu;
 	int			layer;
 	pid_t			last_waker;
 	bool			refresh_layer;
-	u64			layer_cpus_seq;
-	struct bpf_cpumask __kptr *layered_cpumask;
-
+	struct cached_cpus	layered_cpus;
+	/*
+	 * XXX: Old kernels can't track a bpf_cpumask on nested structs
+	 */
+	struct bpf_cpumask __kptr *layered_mask;
+	struct cached_cpus	layered_cpus_llc;
+	struct bpf_cpumask __kptr *layered_llc_mask;
+	struct cached_cpus	layered_cpus_node;
+	struct bpf_cpumask __kptr *layered_node_mask;
 	bool			all_cpus_allowed;
 	u64			runnable_at;
 	u64			running_at;
@@ -506,23 +487,79 @@ int BPF_PROG(tp_task_rename, struct task_struct *p, const char *buf)
 	return 0;
 }
 
-static void maybe_refresh_layered_cpumask(struct cpumask *layered_cpumask,
-					  struct task_struct *p, struct task_ctx *tctx,
-					  const struct cpumask *layer_cpumask)
+static bool should_refresh_cached_cpus(struct cached_cpus *ccpus, s64 id, u64 cpus_seq)
 {
-	u64 layer_seq = layers->cpus_seq;
+	return ccpus->id != id || ccpus->seq != cpus_seq;
+}
 
-	if (tctx->layer_cpus_seq == layer_seq)
+static __always_inline
+void refresh_cached_cpus(struct bpf_cpumask *mask,
+			 struct cached_cpus *ccpus,
+			 s64 id, u64 cpus_seq,
+			 const struct cpumask *cpus_a,
+			 const struct cpumask *cpus_b)
+{
+	if (unlikely(!mask || !cpus_a || !cpus_b)) {
+		scx_bpf_error("NULL ccpus->mask or cpus_a/b");
 		return;
+	}
 
 	/*
 	 * XXX - We're assuming that the updated @layer_cpumask matching the new
 	 * @layer_seq is visible which may not be true. For now, leave it as-is.
 	 * Let's update once BPF grows enough memory ordering constructs.
 	 */
-	bpf_cpumask_and((struct bpf_cpumask *)layered_cpumask, layer_cpumask, p->cpus_ptr);
-	tctx->layer_cpus_seq = layer_seq;
-	trace("%s[%d] cpumask refreshed to seq %llu", p->comm, p->pid, layer_seq);
+	bpf_cpumask_and(mask, cpus_a, cpus_b);
+	ccpus->id = id;
+	ccpus->seq = cpus_seq;
+}
+
+static void maybe_refresh_layered_cpus(struct task_struct *p, struct task_ctx *tctx,
+				       const struct cpumask *layer_cpumask,
+				       u64 cpus_seq)
+{
+	if (should_refresh_cached_cpus(&tctx->layered_cpus, 0, cpus_seq)) {
+		refresh_cached_cpus(tctx->layered_mask, &tctx->layered_cpus, 0, cpus_seq,
+				    p->cpus_ptr, layer_cpumask);
+		trace("%s[%d] layered cpumask refreshed to seq=%llu",
+		      p->comm, p->pid, tctx->layered_cpus.seq);
+	}
+}
+
+static void maybe_refresh_layered_cpus_llc(struct task_struct *p, struct task_ctx *tctx,
+					   const struct cpumask *layer_cpumask,
+					   s32 llc_id, u64 cpus_seq)
+{
+	if (should_refresh_cached_cpus(&tctx->layered_cpus_llc, llc_id, cpus_seq)) {
+		struct cache_ctx *cachec;
+
+		if (!(cachec = lookup_cache_ctx(llc_id)))
+			return;
+		refresh_cached_cpus(tctx->layered_llc_mask,
+				    &tctx->layered_cpus_llc, llc_id, cpus_seq,
+				    cast_mask(tctx->layered_mask),
+				    cast_mask(cachec->cpumask));
+		trace("%s[%d] layered llc cpumask refreshed to llc=%d seq=%llu",
+		      p->comm, p->pid, tctx->layered_cpus_llc.id, tctx->layered_cpus_llc.seq);
+	}
+}
+
+static void maybe_refresh_layered_cpus_node(struct task_struct *p, struct task_ctx *tctx,
+					    const struct cpumask *layer_cpumask,
+					    s32 node_id, u64 cpus_seq)
+{
+	if (should_refresh_cached_cpus(&tctx->layered_cpus_node, node_id, cpus_seq)) {
+		struct node_ctx *nodec;
+
+		if (!(nodec = lookup_node_ctx(node_id)))
+			return;
+		refresh_cached_cpus(tctx->layered_node_mask,
+				    &tctx->layered_cpus_node, node_id, cpus_seq,
+				    cast_mask(tctx->layered_mask),
+				    cast_mask(nodec->cpumask));
+		trace("%s[%d] layered node cpumask refreshed to node=%d seq=%llu",
+		      p->comm, p->pid, tctx->layered_cpus_node.id, tctx->layered_cpus_node.seq);
+	}
 }
 
 static s32 pick_idle_cpu_from(const struct cpumask *cand_cpumask, s32 prev_cpu,
@@ -559,10 +596,11 @@ bool should_try_preempt_first(s32 cand, struct layer *layer,
 	struct cpu_ctx *cand_cctx, *sib_cctx;
 	s32 sib;
 
-	if (!layer->preempt || !layer->preempt_first)
+	if (!layered_cpumask || !layer->preempt || !layer->preempt_first)
 		return false;
 
-	if (layer->kind == LAYER_KIND_CONFINED && !bpf_cpumask_test_cpu(cand, layered_cpumask))
+	if (layer->kind == LAYER_KIND_CONFINED &&
+	    !bpf_cpumask_test_cpu(cand, layered_cpumask))
 		return false;
 
 	if (!(cand_cctx = lookup_cpu_ctx(cand)) || cand_cctx->current_preempt)
@@ -580,23 +618,24 @@ s32 pick_idle_no_topo(struct task_struct *p, s32 prev_cpu,
 		      struct cpu_ctx *cctx, struct task_ctx *tctx,
 		      struct layer *layer, bool from_selcpu)
 {
-	const struct cpumask *idle_cpumask;
+	const struct cpumask *idle_smtmask;
 	struct cpumask *layer_cpumask, *layered_cpumask;
 	s32 cpu;
 
 	/* look up cpumasks */
-	if (!(layered_cpumask = cast_mask(tctx->layered_cpumask)) ||
+	if (!(layered_cpumask = (struct cpumask *)tctx->layered_mask) ||
 	    !(layer_cpumask = lookup_layer_cpumask(tctx->layer)))
 			return -1;
 
 	/* not much to do if bound to a single CPU */
 	if (p->nr_cpus_allowed == 1 && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		if (layer->kind == LAYER_KIND_CONFINED && !bpf_cpumask_test_cpu(prev_cpu, layer_cpumask))
+		if (layer->kind == LAYER_KIND_CONFINED &&
+		    !bpf_cpumask_test_cpu(prev_cpu, layer_cpumask))
 			lstat_inc(LSTAT_AFFN_VIOL, layer, cctx);
 		return prev_cpu;
 	}
 
-	maybe_refresh_layered_cpumask(layered_cpumask, p, tctx, layer_cpumask);
+	maybe_refresh_layered_cpus(p, tctx, layer_cpumask, READ_ONCE(layers->cpus_seq));
 
 	/*
 	 * If @p prefers to preempt @prev_cpu than finding an idle CPU and
@@ -613,14 +652,14 @@ s32 pick_idle_no_topo(struct task_struct *p, s32 prev_cpu,
 	 * If CPU has SMT, any wholly idle CPU is likely a better pick than
 	 * partially idle @prev_cpu.
 	 */
-	idle_cpumask = scx_bpf_get_idle_smtmask();
+	idle_smtmask = scx_bpf_get_idle_smtmask();
 	if ((cpu = pick_idle_cpu_from(layered_cpumask, prev_cpu,
-				      idle_cpumask,
+				      idle_smtmask,
 				      layer->idle_smt)) >= 0)
 		goto out_put;
 
 out_put:
-	scx_bpf_put_idle_cpumask(idle_cpumask);
+	scx_bpf_put_idle_cpumask(idle_smtmask);
 	return cpu;
 }
 
@@ -632,32 +671,23 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	if (disable_topology)
 		return pick_idle_no_topo(p, prev_cpu, cctx, tctx, layer, from_selcpu);
 
-	const struct cpumask *idle_cpumask;
-	struct cache_ctx *cachec;
-	struct node_ctx *nodec;
-	struct bpf_cpumask *pref_idle_cpumask;
-	struct cpumask *layer_cpumask, *layered_cpumask, *cache_cpumask, *node_cpumask;
+	const struct cpumask *idle_smtmask, *layer_cpumask, *cpumask;
+	struct cpu_ctx *prev_cctx;
+	u64 cpus_seq;
 	s32 cpu;
 
-	/* look up cpumasks */
-	if (!(layered_cpumask = cast_mask(tctx->layered_cpumask)) ||
-	    !(layer_cpumask = lookup_layer_cpumask(tctx->layer)) ||
-	    !(cachec = lookup_cache_ctx(cctx->cache_idx)) ||
-	    !(nodec = lookup_node_ctx(cctx->node_idx)))
-			return -1;
-
-	if (!(cache_cpumask = cast_mask(cachec->cpumask)) ||
-	    !(node_cpumask = cast_mask(nodec->cpumask)))
+	if (!(layer_cpumask = lookup_layer_cpumask(tctx->layer)))
 		return -1;
 
 	/* not much to do if bound to a single CPU */
 	if (p->nr_cpus_allowed == 1 && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		if (layer->kind == LAYER_KIND_CONFINED && !bpf_cpumask_test_cpu(prev_cpu, layer_cpumask))
+		if (layer->kind == LAYER_KIND_CONFINED &&
+		    !bpf_cpumask_test_cpu(prev_cpu, layer_cpumask))
 			lstat_inc(LSTAT_AFFN_VIOL, layer, cctx);
 		return prev_cpu;
 	}
 
-	maybe_refresh_layered_cpumask(layered_cpumask, p, tctx, layer_cpumask);
+	cpus_seq = READ_ONCE(layers->cpus_seq);
 
 	/*
 	 * If @p prefers to preempt @prev_cpu than finding an idle CPU and
@@ -665,59 +695,52 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	 * @prev_cpu. The enqueue path will also retry to find an idle CPU if
 	 * the preemption attempt fails.
 	 */
-	if (from_selcpu && should_try_preempt_first(prev_cpu, layer, layered_cpumask)) {
+	maybe_refresh_layered_cpus(p, tctx, layer_cpumask, cpus_seq);
+	if (!(cpumask = cast_mask(tctx->layered_mask)))
+		return -1;
+	if (from_selcpu && should_try_preempt_first(prev_cpu, layer, cpumask)) {
 		cctx->try_preempt_first = true;
 		return -1;
 	}
 
-	if (layer->idle_smt) {
-		idle_cpumask = scx_bpf_get_idle_smtmask();
-	} else {
-		idle_cpumask = scx_bpf_get_idle_cpumask();
-	}
-
-	pref_idle_cpumask = bpf_cpumask_create();
-
-	if (!pref_idle_cpumask || !idle_cpumask) {
-		cpu = -1;
-		goto out_put;
-	}
+	if (!(prev_cctx = lookup_cpu_ctx(prev_cpu)) ||
+	    !(idle_smtmask = scx_bpf_get_idle_smtmask()))
+		return -1;
 
 	/*
 	 * Try a CPU in the current LLC
 	 */
-	bpf_cpumask_copy(pref_idle_cpumask, idle_cpumask);
-	bpf_cpumask_and(pref_idle_cpumask, cache_cpumask,
-			cast_mask(pref_idle_cpumask));
-	bpf_cpumask_and(pref_idle_cpumask, layer_cpumask,
-			cast_mask(pref_idle_cpumask));
-	if ((cpu = pick_idle_cpu_from(cast_mask(pref_idle_cpumask),
-				      prev_cpu, idle_cpumask,
-				      layer->idle_smt)) >= 0)
-		goto out_put;
+	if (nr_llcs > 1) {
+		maybe_refresh_layered_cpus_llc(p, tctx, layer_cpumask,
+					       prev_cctx->cache_idx, cpus_seq);
+		if (!(cpumask = cast_mask(tctx->layered_llc_mask))) {
+			cpu = -1;
+			goto out_put;
+		}
+		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask,
+					      layer->idle_smt)) >= 0)
+			goto out_put;
+	}
 
 	/*
-	 * If the layer uses BigLittle growth algo try a big cpu
+	 * If the layer uses BigLittle growth algo try a big cpu.
+	 * TODO - Cache layered_cpus.mask & big_cpumask.
 	 */
-	if (has_little_cores
-	    && big_cpumask
-	    && layer->growth_algo == GROWTH_ALGO_BIG_LITTLE)
-	{
-		if (!pref_idle_cpumask || !big_cpumask) {
-			cpu = -1;
-			goto out_put;
-		}
-		bpf_cpumask_copy(pref_idle_cpumask, idle_cpumask);
-		if (!pref_idle_cpumask || !big_cpumask) {
-			cpu = -1;
-			goto out_put;
-		}
-		bpf_cpumask_and(pref_idle_cpumask, cast_mask(big_cpumask),
-				cast_mask(pref_idle_cpumask));
+	if (has_little_cores && big_cpumask &&
+	    layer->growth_algo == GROWTH_ALGO_BIG_LITTLE) {
+		struct bpf_cpumask *tmp_cpumask;
 
-		if ((cpu = pick_idle_cpu_from(cast_mask(pref_idle_cpumask),
-					      prev_cpu, idle_cpumask,
-					      layer->idle_smt)) >= 0)
+		if (!(tmp_cpumask = bpf_cpumask_create())) {
+			cpu = -1;
+			goto out_put;
+		}
+		bpf_cpumask_and(tmp_cpumask, cast_mask(tctx->layered_mask),
+				cast_mask(big_cpumask));
+		cpu = pick_idle_cpu_from(cast_mask(tmp_cpumask),
+					 prev_cpu, idle_smtmask,
+					 layer->idle_smt);
+		bpf_cpumask_release(tmp_cpumask);
+		if (cpu >= 0)
 			goto out_put;
 	}
 
@@ -725,17 +748,13 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	 * Next try a CPU in the current node
 	 */
 	if (nr_nodes > 1) {
-		if (!pref_idle_cpumask || !idle_cpumask) {
+		maybe_refresh_layered_cpus_node(p, tctx, layer_cpumask,
+						prev_cctx->node_idx, cpus_seq);
+		if (!(cpumask = cast_mask(tctx->layered_node_mask))) {
 			cpu = -1;
 			goto out_put;
 		}
-		bpf_cpumask_copy(pref_idle_cpumask, idle_cpumask);
-		bpf_cpumask_and(pref_idle_cpumask, node_cpumask,
-				cast_mask(pref_idle_cpumask));
-		bpf_cpumask_and(pref_idle_cpumask, layer_cpumask,
-				cast_mask(pref_idle_cpumask));
-		if ((cpu = pick_idle_cpu_from(cast_mask(pref_idle_cpumask),
-					      prev_cpu, idle_cpumask,
+		if ((cpu = pick_idle_cpu_from(cpumask, prev_cpu, idle_smtmask,
 					      layer->idle_smt)) >= 0)
 			goto out_put;
 	}
@@ -744,8 +763,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	 * If the layer is an open one, we can try the whole machine.
 	 */
 	if (layer->kind != LAYER_KIND_CONFINED &&
-	    ((cpu = pick_idle_cpu_from(p->cpus_ptr, prev_cpu,
-				       idle_cpumask,
+	    ((cpu = pick_idle_cpu_from(p->cpus_ptr, prev_cpu, idle_smtmask,
 				       layer->idle_smt)) >= 0)) {
 		lstat_inc(LSTAT_OPEN_IDLE, layer, cctx);
 		goto out_put;
@@ -754,9 +772,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	cpu = -1;
 
 out_put:
-	if (pref_idle_cpumask)
-		bpf_cpumask_release(pref_idle_cpumask);
-	scx_bpf_put_idle_cpumask(idle_cpumask);
+	scx_bpf_put_idle_cpumask(idle_smtmask);
 	return cpu;
 }
 
@@ -914,7 +930,6 @@ void try_preempt_no_topo(s32 task_cpu, struct task_struct *p,
 
 	lstat_inc(LSTAT_PREEMPT_FAIL, layer, cctx);
 
-preempt_fail:
 	lstat_inc(LSTAT_PREEMPT_FAIL, layer, cctx);
 }
 
@@ -967,7 +982,6 @@ void try_preempt(s32 task_cpu, struct task_struct *p, struct task_ctx *tctx,
 	if (!(cachec = lookup_cache_ctx(cctx->cache_idx)) ||
 	    !(nodec = lookup_node_ctx(cctx->node_idx)) ||
 	    !cachec->cpumask) {
-		scx_bpf_error("can't happen");
 		return;
 	}
 
@@ -1062,16 +1076,15 @@ preempt_fail:
 
 void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct cpu_ctx *cctx;
+	struct cpu_ctx *cctx, *task_cctx;
 	struct task_ctx *tctx;
 	struct layer *layer;
 	s32 task_cpu = scx_bpf_task_cpu(p);
 	u64 vtime = p->scx.dsq_vtime;
 	bool try_preempt_first;
-	u32 idx;
 
-	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)) ||
-	    !(layer = lookup_layer(tctx->layer)))
+	if (!(cctx = lookup_cpu_ctx(-1)) || !(task_cctx = lookup_cpu_ctx(task_cpu)) ||
+	    !(tctx = lookup_task_ctx(p)) || !(layer = lookup_layer(tctx->layer)))
 		return;
 
 	try_preempt_first = cctx->try_preempt_first;
@@ -1114,9 +1127,8 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		    !bpf_cpumask_test_cpu(task_cpu, layer_cpumask))
 			lstat_inc(LSTAT_AFFN_VIOL, layer, cctx);
 
-		idx = cpu_hi_fallback_dsq_id(task_cpu);
-		tctx->last_dsq = idx;
-		scx_bpf_dispatch(p, idx, slice_ns, enq_flags);
+		tctx->last_dsq = task_cctx->hi_fallback_dsq_id;
+		scx_bpf_dispatch(p, tctx->last_dsq, slice_ns, enq_flags);
 		goto preempt;
 	}
 
@@ -1140,22 +1152,13 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		 * to the LLC local HI_FALLBACK_DSQ to avoid this starvation
 		 * issue.
 		 */
-		idx = cpu_hi_fallback_dsq_id(task_cpu);
-		scx_bpf_dispatch(p, idx, slice_ns, enq_flags);
-		tctx->last_dsq = idx;
+		tctx->last_dsq = task_cctx->hi_fallback_dsq_id;
+		scx_bpf_dispatch(p, tctx->last_dsq, slice_ns, enq_flags);
 		goto preempt;
 	}
 
-	if (disable_topology) {
-		tctx->last_dsq = tctx->layer;
-		scx_bpf_dispatch_vtime(p, tctx->layer, slice_ns, vtime, enq_flags);
-	} else {
-		u32 llc_id = cpu_to_llc_id(tctx->last_cpu >= 0 ? tctx->last_cpu :
-					   bpf_get_smp_processor_id());
-		idx = layer_dsq_id(layer->idx, llc_id);
-		tctx->last_dsq = idx;
-		scx_bpf_dispatch_vtime(p, idx, slice_ns, vtime, enq_flags);
-	}
+	tctx->last_dsq = layer_dsq_id(layer->idx, task_cctx->cache_idx);
+	scx_bpf_dispatch_vtime(p, tctx->last_dsq, slice_ns, vtime, enq_flags);
 
 preempt:
 	try_preempt(task_cpu, p, tctx, try_preempt_first, enq_flags);
@@ -1201,21 +1204,11 @@ static bool keep_running(struct cpu_ctx *cctx, struct task_struct *p)
 		 * have tasks waiting, keep running it. If there are multiple
 		 * competing preempting layers, this won't work well.
 		 */
-		if (disable_topology) {
-			if (!scx_bpf_dsq_nr_queued(layer->idx)) {
-				p->scx.slice = slice_ns;
-				lstat_inc(LSTAT_KEEP, layer, cctx);
-				return true;
-			}
-		} else {
-			u32 dsq_id = cpu_to_llc_id(tctx->last_cpu >= 0 ?
-						   tctx->last_cpu :
-						   bpf_get_smp_processor_id());
-			if (!scx_bpf_dsq_nr_queued(dsq_id)) {
-				p->scx.slice = slice_ns;
-				lstat_inc(LSTAT_KEEP, layer, cctx);
-				return true;
-			}
+		u32 dsq_id = layer_dsq_id(layer->idx, cctx->cache_idx);
+		if (!scx_bpf_dsq_nr_queued(dsq_id)) {
+			p->scx.slice = slice_ns;
+			lstat_inc(LSTAT_KEEP, layer, cctx);
+			return true;
 		}
 	} else {
 		const struct cpumask *idle_cpumask = scx_bpf_get_idle_cpumask();
@@ -1347,7 +1340,8 @@ bool antistall_consume(s32 cpu, struct cpu_ctx *cctx)
 	}
 
 reset:
-	trace("antistall reset DSQ[%llu] SELECTED_CPU[%llu] DELAY[%llu]", *antistall_dsq, cpu, cur_delay);
+	trace("antistall reset DSQ[%llu] SELECTED_CPU[%llu] DELAY[%llu]",
+	      *antistall_dsq, cpu, cur_delay);
 	*antistall_dsq = SCX_DSQ_INVALID;
 	return consumed;
 }
@@ -1418,8 +1412,7 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 			return;
 	}
 
-	dsq_id = cpu_hi_fallback_dsq_id(cpu);
-	if (scx_bpf_consume(dsq_id))
+	if (scx_bpf_consume(cctx->hi_fallback_dsq_id))
 		return;
 
 	/* consume !open layers second */
@@ -1482,7 +1475,7 @@ __weak int consume_preempting(struct cost *costc, u32 my_llc_id)
 					return -EINVAL;
 				}
 				layer = MEMBER_VPTR(layers, [layer_idx]);
-				if (has_budget(costc, layer) == 0)
+				if (!layer->preempt || has_budget(costc, layer) == 0)
 					continue;
 				dsq_id = layer_dsq_id(layer_idx, llc_id);
 				if (scx_bpf_consume(dsq_id))
@@ -1678,8 +1671,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
-	u32 my_llc_id = cpu_to_llc_id(cpu);
-
 	/*
 	 * If one of the fallback DSQs has the most budget then consume from it
 	 * to prevent starvation.
@@ -1694,19 +1685,18 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/* consume preempting layers first */
-	if (consume_preempting(costc, my_llc_id) == 0)
+	if (consume_preempting(costc, cctx->cache_idx) == 0)
 		return;
 
-	dsq_id = cpu_hi_fallback_dsq_id(cpu);
-	if (scx_bpf_consume(dsq_id))
+	if (scx_bpf_consume(cctx->hi_fallback_dsq_id))
 		return;
 
 	/* consume !open layers second */
-	if (consume_non_open(costc, cpu, my_llc_id) == 0)
+	if (consume_non_open(costc, cpu, cctx->cache_idx) == 0)
 		return;
 
 	/* consume !preempting open layers */
-	if (consume_open_no_preempt(costc, my_llc_id) == 0)
+	if (consume_open_no_preempt(costc, cctx->cache_idx) == 0)
 		return;
 
 	scx_bpf_consume(LO_FALLBACK_DSQ);
@@ -1855,7 +1845,9 @@ static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *tctx)
 		struct layer *layer = &layers[idx];
 
 		tctx->layer = idx;
-		tctx->layer_cpus_seq = layer->cpus_seq - 1;
+		tctx->layered_cpus.seq = layer->cpus_seq - 1;
+		tctx->layered_cpus_llc.seq = layer->cpus_seq - 1;
+		tctx->layered_cpus_node.seq = layer->cpus_seq - 1;
 		__sync_fetch_and_add(&layer->nr_tasks, 1);
 		/*
 		 * XXX - To be correct, we'd need to calculate the vtime
@@ -1987,13 +1979,14 @@ static s32 create_cache(u32 cache_id)
 			return -ENOENT;
 		}
 
-		llc_id = __cpu_to_llc_id(cpu);
+		llc_id = cpu_to_llc_id(cpu);
 		if (llc_id != cache_id)
 			continue;
 
 		bpf_cpumask_set_cpu(cpu, cpumask);
 		cachec->nr_cpus++;
 		cctx->cache_idx = cache_id;
+		cctx->hi_fallback_dsq_id = llc_hi_fallback_dsq_id(cache_id);
 	}
 
 	dbg("CFG creating cache %d with %d cpus", cache_id, cachec->nr_cpus);
@@ -2101,8 +2094,10 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 		}
 	}
 
-	if (layer->perf > 0)
+	if (layer->perf > 0 && cctx->perf != layer->perf) {
 		scx_bpf_cpuperf_set(task_cpu, layer->perf);
+		cctx->perf = layer->perf;
+	}
 
 	cctx->maybe_idle = false;
 }
@@ -2223,11 +2218,19 @@ void BPF_STRUCT_OPS(layered_cpu_release, s32 cpu,
 	scx_bpf_reenqueue_local();
 }
 
+static int init_cached_cpus(struct cached_cpus *ccpus)
+{
+	ccpus->id = -1;
+
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS(layered_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
 	struct task_ctx *tctx;
 	struct bpf_cpumask *cpumask;
+	s32 ret;
 
 	/*
 	 * XXX - We want BPF_NOEXIST but bpf_map_delete_elem() in .disable() may
@@ -2241,13 +2244,41 @@ s32 BPF_STRUCT_OPS(layered_init_task, struct task_struct *p,
 		return -ENOMEM;
 	}
 
-	cpumask = bpf_cpumask_create();
-	if (!cpumask)
+	// Layer setup
+	ret = init_cached_cpus(&tctx->layered_cpus);
+	if (ret)
+		return ret;
+	if (!(cpumask = bpf_cpumask_create()))
 		return -ENOMEM;
 
-	cpumask = bpf_kptr_xchg(&tctx->layered_cpumask, cpumask);
-	if (cpumask) {
+	if ((cpumask = bpf_kptr_xchg(&tctx->layered_mask, cpumask))) {
 		/* Should never happen as we just inserted it above. */
+		bpf_cpumask_release(cpumask);
+		return -EINVAL;
+	}
+
+	// LLC setup
+	ret = init_cached_cpus(&tctx->layered_cpus_llc);
+	if (ret)
+		return ret;
+
+	if (!(cpumask = bpf_cpumask_create()))
+		return -ENOMEM;
+
+	if ((cpumask = bpf_kptr_xchg(&tctx->layered_llc_mask, cpumask))) {
+		bpf_cpumask_release(cpumask);
+		return -EINVAL;
+	}
+
+	// Node setup
+	ret = init_cached_cpus(&tctx->layered_cpus_node);
+	if (ret)
+		return ret;
+
+	if (!(cpumask = bpf_cpumask_create()))
+		return -ENOMEM;
+
+	if ((cpumask = bpf_kptr_xchg(&tctx->layered_node_mask, cpumask))) {
 		bpf_cpumask_release(cpumask);
 		return -EINVAL;
 	}
@@ -2409,23 +2440,16 @@ void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 			continue;
 		}
 
-		if (disable_topology) {
-			scx_bpf_dump("LAYER[%d][%s] nr_cpus=%u nr_queued=%d -%llums cpus=",
-				     i, layer->name, layer->nr_cpus,
-				     scx_bpf_dsq_nr_queued(i),
-				     dsq_first_runnable_for_ms(i, now));
-		} else {
-			bpf_for(j, 0, nr_llcs) {
-				if (!(layer->cache_mask & (1 << j)))
-					continue;
+		bpf_for(j, 0, nr_llcs) {
+			if (!(layer->cache_mask & (1 << j)))
+				continue;
 
-				idx = layer_dsq_id(layer->idx, j);
-				scx_bpf_dump("LAYER[%d][%s]DSQ[%d] nr_cpus=%u nr_queued=%d -%llums cpus=",
-					     i, layer->name, idx, layer->nr_cpus,
-					     scx_bpf_dsq_nr_queued(idx),
-					     dsq_first_runnable_for_ms(idx, now));
-				scx_bpf_dump("\n");
-			}
+			idx = layer_dsq_id(layer->idx, j);
+			scx_bpf_dump("LAYER[%d][%s]DSQ[%d] nr_cpus=%u nr_queued=%d -%llums cpus=",
+				     i, layer->name, idx, layer->nr_cpus,
+				     scx_bpf_dsq_nr_queued(idx),
+				     dsq_first_runnable_for_ms(idx, now));
+			scx_bpf_dump("\n");
 		}
 		dump_layer_cpumask(i);
 		scx_bpf_dump("\n");
@@ -2473,11 +2497,11 @@ static bool layered_monitor(void)
  */
 u64 antistall_set(u64 dsq_id, u64 jiffies_now)
 {
-	struct task_struct *p;
+	struct task_struct *__p, *p = NULL;
 	struct task_ctx *tctx;
 	s32 cpu;
 	u64 *antistall_dsq, *delay, cur_delay;
-	bool first_pass;
+	int pass;
 	u32 zero;
 
 	zero = 0;
@@ -2487,7 +2511,12 @@ u64 antistall_set(u64 dsq_id, u64 jiffies_now)
 
 	// verifier
 	bpf_rcu_read_lock();
-	bpf_for_each(scx_dsq, p, dsq_id, 0) {
+	bpf_for_each(scx_dsq, __p, dsq_id, 0) {
+		/* XXX verifier workaround: drop the following block later */
+		if (p)
+			bpf_task_release(p);
+		if (!(p = bpf_task_from_pid(__p->pid)))
+			continue;
 
 		if (!(tctx = lookup_task_ctx(p)))
 			goto unlock;
@@ -2497,13 +2526,18 @@ u64 antistall_set(u64 dsq_id, u64 jiffies_now)
 			// check head task in dsq
 			goto unlock;
 
-		first_pass = true;
-look_for_cpu:
-		bpf_for(cpu, 0, nr_possible_cpus) {
-			if (!tctx->layered_cpumask)
+		#pragma unroll
+		for (pass = 0; pass < 2; ++pass) bpf_for(cpu, 0, nr_possible_cpus) {
+			const struct cpumask *cpumask;
+
+			if (!(cpumask = cast_mask(tctx->layered_mask)))
 				goto unlock;
 
-			if (!bpf_cpumask_test_cpu(cpu,   cast_mask(tctx->layered_cpumask)))
+			/* for affinity violating tasks, target all allowed CPUs */
+			if (bpf_cpumask_empty(cpumask))
+				cpumask = p->cpus_ptr;
+
+			if (!bpf_cpumask_test_cpu(cpu, cpumask))
 				continue;
 
 			antistall_dsq = bpf_map_lookup_percpu_elem(&antistall_cpu_dsq, &zero, cpu);
@@ -2514,33 +2548,21 @@ look_for_cpu:
 				goto unlock;
 			}
 
-			if (*antistall_dsq == SCX_DSQ_INVALID) {
+			if ((pass == 0 && *antistall_dsq == SCX_DSQ_INVALID) ||
+			    (pass != 0 && *delay < cur_delay)) {
 				trace("antistall set DSQ[%llu] SELECTED_CPU[%llu] DELAY[%llu]", dsq_id, cpu, cur_delay);
 				*delay = cur_delay;
 				*antistall_dsq = dsq_id;
 				goto unlock;
 			}
-
-			if (first_pass)
-				continue;
-
-			if (*delay < cur_delay) {
-				trace("antistall set DSQ[%llu] SELECTED_CPU[%llu] DELAY[%llu]", dsq_id, cpu, cur_delay);
-				*delay = cur_delay;
-				*antistall_dsq = dsq_id;
-				goto unlock;
-			}
-		}
-
-		if (first_pass) {
-			first_pass = false;
-			goto look_for_cpu;
 		}
 
 		goto unlock;
 	}
 
 unlock:
+	if (p)
+		bpf_task_release(p);
 	bpf_rcu_read_unlock();
 	return 0;
 }
@@ -2554,8 +2576,8 @@ unlock:
  */
 static bool antistall_scan(void)
 {
-	s32 cpu;
-	u64 dsq_id;
+	s32 llc;
+	u64 layer_id;
 	u64 jiffies_now;
 
 	if (!enable_antistall)
@@ -2563,14 +2585,12 @@ static bool antistall_scan(void)
 
 	jiffies_now = bpf_jiffies64();
 
-	bpf_for(dsq_id, 0, nr_layers) {
-		antistall_set(dsq_id, jiffies_now);
-	}
+	bpf_for(layer_id, 0, nr_layers)
+		bpf_for(llc, 0, nr_llcs)
+			antistall_set(layer_dsq_id(layer_id, llc), jiffies_now);
 
-	bpf_for(cpu, 0, nr_possible_cpus) {
-		dsq_id = cpu_hi_fallback_dsq_id(cpu);
-		antistall_set(dsq_id, jiffies_now);
-	}
+	bpf_for(llc, 0, nr_llcs)
+		antistall_set(llc_hi_fallback_dsq_id(llc), jiffies_now);
 
 	antistall_set(LO_FALLBACK_DSQ, jiffies_now);
 
@@ -2608,7 +2628,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 	struct bpf_cpumask *cpumask, *tmp_big_cpumask;
 	struct cpu_ctx *cctx;
 	int i, j, k, nr_online_cpus, ret;
-	u64 *init_antistall_delay, *init_antistall_dsq;
+	u64 *init_antistall_dsq;
 	u32 zero;
 
 	zero = 0;
@@ -2685,8 +2705,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 		struct layer *layer = &layers[i];
 
 		dbg("CFG LAYER[%d][%s] min_exec_ns=%lu open=%d preempt=%d exclusive=%d",
-		    i, layer->name, layer->min_exec_ns, layer->kind != LAYER_KIND_CONFINED, layer->preempt,
-		    layer->exclusive);
+		    i, layer->name, layer->min_exec_ns,
+		    layer->kind != LAYER_KIND_CONFINED,
+		    layer->preempt, layer->exclusive);
 
 		if (layer->nr_match_ors > MAX_LAYER_MATCH_ORS) {
 			scx_bpf_error("too many ORs");
