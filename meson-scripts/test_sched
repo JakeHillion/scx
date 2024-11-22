@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Run a scheduler for TIMEOUT seconds inside virtme-ng and catch potential
 # errors, then unload the scheduler and return the exit status.
