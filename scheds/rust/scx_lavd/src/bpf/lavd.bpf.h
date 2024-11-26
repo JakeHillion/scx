@@ -20,8 +20,8 @@ enum consts_internal  {
 	LAVD_MAX_RETRY			= 4,
 
 	LAVD_TARGETED_LATENCY_NS	= (20ULL * NSEC_PER_MSEC),
-	LAVD_SLICE_MIN_NS		= (300ULL * NSEC_PER_USEC), /* min time slice */
-	LAVD_SLICE_MAX_NS		= (3ULL * NSEC_PER_MSEC), /* max time slice */
+	LAVD_SLICE_MIN_NS_DFL		= (300ULL * NSEC_PER_USEC), /* min time slice */
+	LAVD_SLICE_MAX_NS_DFL		= (3ULL * NSEC_PER_MSEC), /* max time slice */
 
 	LAVD_LC_FREQ_MAX		= 1000000,
 	LAVD_LC_RUNTIME_MAX		= LAVD_TIME_ONE_SEC,
@@ -50,11 +50,8 @@ enum consts_internal  {
 	LAVD_AP_HIGH_UTIL		= 700, /* balanced mode when 10% < cpu util <= 40%,
 						  performance mode when cpu util > 40% */
 
-	LAVD_CPDOM_STARV_NS		= (5ULL * NSEC_PER_MSEC),
+	LAVD_CPDOM_STARV_NS		= (2 * LAVD_SLICE_MAX_NS_DFL),
 };
-
-const volatile u64 LAVD_TIME_INFINITY_NS;
-const volatile u64 LAVD_SLICE_UNDECIDED;
 
 /*
  * Compute domain context
@@ -87,7 +84,6 @@ struct cpu_ctx {
 	 * Information used to keep track of load
 	 */
 	volatile u64	tot_svc_time;	/* total service time on a CPU */
-	volatile u64	last_kick_clk;	/* when the CPU was kicked */
 
 	/*
 	 * Information used to keep track of latency criticality
@@ -100,8 +96,8 @@ struct cpu_ctx {
 	 * Information used to keep track of performance criticality
 	 */
 	volatile u64	sum_perf_cri;	/* sum of performance criticality */
-	volatile u64	min_perf_cri;	/* mininum performance criticality */
-	volatile u64	max_perf_cri;	/* maximum performance criticality */
+	volatile u32	min_perf_cri;	/* mininum performance criticality */
+	volatile u32	max_perf_cri;	/* maximum performance criticality */
 
 	/*
 	 * Information of a current running task for preemption
@@ -109,8 +105,7 @@ struct cpu_ctx {
 	volatile u64	stopping_tm_est_ns; /* estimated stopping time */
 	volatile u16	lat_cri;	/* latency criticality */
 	volatile u8	is_online;	/* is this CPU online? */
-	volatile bool	lock_holder;	/* is a lock holder running */
-	s32		cpu_id;		/* cpu id */
+	volatile u8	lock_holder;	/* is a lock holder running */
 
 	/*
 	 * Information for CPU frequency scaling
@@ -123,31 +118,33 @@ struct cpu_ctx {
 	 * Fields for core compaction
 	 *
 	 */
+	u16		cpu_id;		/* cpu id */
 	u16		capacity;	/* CPU capacity based on 1000 */
 	u8		big_core;	/* is it a big core? */
 	u8		turbo_core;	/* is it a turbo core? */
 	u8		cpdom_id;	/* compute domain id (== dsq_id) */
 	u8		cpdom_alt_id;	/* compute domain id of anternative type (== dsq_id) */
 	u8		cpdom_poll_pos;	/* index to check if a DSQ of a compute domain is starving */
-	struct bpf_cpumask __kptr *tmp_a_mask;	/* temporary cpu mask */
-	struct bpf_cpumask __kptr *tmp_o_mask;	/* temporary cpu mask */
-	struct bpf_cpumask __kptr *tmp_t_mask;	/* temporary cpu mask */
-	struct bpf_cpumask __kptr *tmp_t2_mask;	/* temporary cpu mask */
 
 	/*
 	 * Information for statistics.
 	 */
-	volatile u32	nr_preemption;	/* number of migrations */
-	volatile u32	nr_greedy;	/* number of greedy tasks scheduled */
 	volatile u32	nr_perf_cri;
 	volatile u32	nr_lat_cri;
-	volatile u32	nr_lhp;		/* number of lock holder preemption */
 
 	/*
 	 * Information for cpu hotplug
 	 */
 	u64		online_clk;	/* when a CPU becomes online */
 	u64		offline_clk;	/* when a CPU becomes offline */
+
+	/*
+	 * Temporary cpu masks
+	 */
+	struct bpf_cpumask __kptr *tmp_a_mask;
+	struct bpf_cpumask __kptr *tmp_o_mask;
+	struct bpf_cpumask __kptr *tmp_t_mask;
+	struct bpf_cpumask __kptr *tmp_t2_mask;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 

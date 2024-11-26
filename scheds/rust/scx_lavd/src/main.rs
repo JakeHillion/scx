@@ -95,6 +95,14 @@ struct Opts {
     #[clap(long = "balanced", action = clap::ArgAction::SetTrue)]
     balanced: bool,
 
+    /// Maximum scheduling slice duration in microseconds.
+    #[clap(long = "slice-max-us", default_value = "3000")]
+    slice_max_us: u64,
+
+    /// Minimum scheduling slice duration in microseconds.
+    #[clap(long = "slice-min-us", default_value = "300")]
+    slice_min_us: u64,
+
     /// Disable core compaction and schedule tasks across all online CPUs. Core compaction attempts
     /// to keep idle CPUs idle in favor of scheduling tasks on CPUs that are already
     /// awake. See main.bpf.c for more info. Normally set by the power mode, but can be set independently if
@@ -300,24 +308,24 @@ impl FlatTopology {
         // Build a vector of cpu flat ids.
         let mut base_freq = 0;
         let mut avg_freq = 0;
-        for (_node_pos, node) in topo.nodes().iter().enumerate() {
-            for (llc_pos, (_llc_id, llc)) in node.llcs().iter().enumerate() {
-                for (core_pos, (_core_id, core)) in llc.cores().iter().enumerate() {
-                    for (cpu_pos, (cpu_id, cpu)) in core.cpus().iter().enumerate() {
+        for (&node_id, node) in topo.nodes.iter() {
+            for (llc_pos, (_llc_id, llc)) in node.llcs.iter().enumerate() {
+                for (core_pos, (_core_id, core)) in llc.cores.iter().enumerate() {
+                    for (cpu_pos, (cpu_id, cpu)) in core.cpus.iter().enumerate() {
                         let cpu_fid = CpuFlatId {
-                            node_id: node.id(),
+                            node_id,
                             llc_pos,
-                            max_freq: cpu.max_freq(),
+                            max_freq: cpu.max_freq,
                             core_pos,
                             cpu_pos,
                             cpu_id: *cpu_id,
                             cpu_cap: 0,
                         };
                         cpu_fids.push(cpu_fid);
-                        if base_freq < cpu.max_freq() {
-                            base_freq = cpu.max_freq();
+                        if base_freq < cpu.max_freq {
+                            base_freq = cpu.max_freq;
                         }
-                        avg_freq += cpu.max_freq();
+                        avg_freq += cpu.max_freq;
                     }
                 }
             }
@@ -500,9 +508,6 @@ impl<'a> Scheduler<'a> {
         skel_builder.obj_builder.debug(opts.verbose > 0);
         let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops)?;
 
-        // Initialize BPF program constants values from the running kernel
-        Self::init_rodata(&mut skel);
-
         // Initialize CPU topology
         let topo = FlatTopology::new().unwrap();
         Self::init_cpus(&mut skel, &topo);
@@ -536,11 +541,6 @@ impl<'a> Scheduler<'a> {
             stats_server,
             mseq_id: 0,
         })
-    }
-
-    fn init_rodata(skel: &mut OpenBpfSkel) {
-        skel.maps.rodata_data.LAVD_TIME_INFINITY_NS = scx_enums.SCX_SLICE_INF;
-        skel.maps.rodata_data.LAVD_SLICE_UNDECIDED = scx_enums.SCX_SLICE_INF;
     }
 
     fn init_cpus(skel: &mut OpenBpfSkel, topo: &FlatTopology) {
@@ -601,6 +601,8 @@ impl<'a> Scheduler<'a> {
         };
         skel.maps.rodata_data.is_autopilot_on = opts.autopilot;
         skel.maps.rodata_data.verbose = opts.verbose;
+        skel.maps.rodata_data.slice_max_ns = opts.slice_max_us * 1000;
+        skel.maps.rodata_data.slice_min_ns = opts.slice_min_us * 1000;
     }
 
     fn get_msg_seq_id() -> u64 {
@@ -704,12 +706,9 @@ impl<'a> Scheduler<'a> {
                 let st = bss_data.__sys_stats[0];
 
                 let mseq = self.mseq_id;
-                let avg_svc_time = st.avg_svc_time;
                 let nr_queued_task = st.nr_queued_task;
                 let nr_active = st.nr_active;
                 let nr_sched = st.nr_sched;
-                let pc_lhp = Self::get_pc(st.nr_lhp, nr_sched);
-                let pc_greedy = Self::get_pc(st.nr_greedy, nr_sched);
                 let pc_pc = Self::get_pc(st.nr_perf_cri, nr_sched);
                 let pc_lc = Self::get_pc(st.nr_lat_cri, nr_sched);
                 let nr_big = st.nr_big;
@@ -726,12 +725,9 @@ impl<'a> Scheduler<'a> {
 
                 StatsRes::SysStats(SysStats {
                     mseq,
-                    avg_svc_time,
                     nr_queued_task,
                     nr_active,
                     nr_sched,
-                    pc_lhp,
-                    pc_greedy,
                     pc_pc,
                     pc_lc,
                     pc_big,

@@ -26,6 +26,7 @@ use crate::bpf_intf;
 use crate::BpfStats;
 use crate::Layer;
 use crate::Stats;
+use crate::LAYER_USAGE_OPEN;
 
 fn fmt_pct(v: f64) -> String {
     if v >= 99.995 {
@@ -49,19 +50,17 @@ fn fmt_num(v: u64) -> String {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(_om_prefix = "l_", _om_label = "layer_name")]
 pub struct LayerStats {
-    #[stat(desc = "CPU utilization (100% means one full CPU)")]
+    #[stat(desc = "index", _om_skip)]
+    pub index: usize,
+    #[stat(desc = "Total CPU utilization (100% means one full CPU)")]
     pub util: f64,
+    #[stat(desc = "Open CPU utilization %")]
+    pub util_open: f64,
     #[stat(desc = "fraction of total CPU utilization")]
     pub util_frac: f64,
     #[stat(desc = "sum of weight * duty_cycle for tasks")]
     pub load: f64,
     #[stat(desc = "layer load fraction adjusted for infeasible weights")]
-    pub load_frac_adj: f64,
-    #[stat(desc = "layer duty cycle adjusted for infeasible weights")]
-    pub dcycle: f64,
-    #[stat(desc = "fraction of total load")]
-    pub load_frac: f64,
-    #[stat(desc = "count of tasks")]
     pub tasks: u32,
     #[stat(desc = "count of sched events during the period")]
     pub total: u64,
@@ -131,6 +130,10 @@ pub struct LayerStats {
     pub max_nr_cpus: u32,
     #[stat(desc = "slice duration config")]
     pub slice_us: u64,
+    #[stat(desc = "Per-LLC scheduling event fractions")]
+    pub llc_fracs: Vec<f64>,
+    #[stat(desc = "Per-LLC average latency")]
+    pub llc_lats: Vec<f64>,
 }
 
 impl LayerStats {
@@ -158,10 +161,10 @@ impl LayerStats {
         nr_cpus_range: (usize, usize),
     ) -> Self {
         let lstat = |sidx| bstats.lstats[lidx][sidx as usize];
-        let ltotal = lstat(bpf_intf::layer_stat_idx_LSTAT_SEL_LOCAL)
-            + lstat(bpf_intf::layer_stat_idx_LSTAT_ENQ_WAKEUP)
-            + lstat(bpf_intf::layer_stat_idx_LSTAT_ENQ_EXPIRE)
-            + lstat(bpf_intf::layer_stat_idx_LSTAT_ENQ_REENQ);
+        let ltotal = lstat(bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL)
+            + lstat(bpf_intf::layer_stat_id_LSTAT_ENQ_WAKEUP)
+            + lstat(bpf_intf::layer_stat_id_LSTAT_ENQ_EXPIRE)
+            + lstat(bpf_intf::layer_stat_id_LSTAT_ENQ_REENQ);
         let lstat_pct = |sidx| {
             if ltotal != 0 {
                 lstat(sidx) as f64 / ltotal as f64 * 100.0
@@ -173,70 +176,84 @@ impl LayerStats {
             if b != 0.0 { a / b * 100.0 } else { 0.0 }
         };
 
+        let util_sum = stats.layer_utils[lidx].iter().sum::<f64>();
+
         Self {
-            util: stats.layer_utils[lidx] * 100.0,
-            util_frac: calc_frac(stats.layer_utils[lidx], stats.total_util),
+            index: lidx,
+            util: util_sum * 100.0,
+            util_open: if util_sum != 0.0 {
+                stats.layer_utils[lidx][LAYER_USAGE_OPEN] / util_sum * 100.0
+            } else {
+                0.0
+            },
+            util_frac: calc_frac(util_sum, stats.total_util),
             load: normalize_load_metric(stats.layer_loads[lidx]),
-            load_frac_adj: calc_frac(stats.layer_load_sums[lidx], stats.total_load_sum),
-            dcycle: calc_frac(stats.layer_dcycle_sums[lidx], stats.total_dcycle_sum),
-            load_frac: calc_frac(stats.layer_loads[lidx], stats.total_load),
             tasks: stats.nr_layer_tasks[lidx] as u32,
             total: ltotal,
-            sel_local: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_SEL_LOCAL),
-            enq_wakeup: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_ENQ_WAKEUP),
-            enq_expire: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_ENQ_EXPIRE),
-            enq_reenq: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_ENQ_REENQ),
-            min_exec: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_MIN_EXEC),
-            min_exec_us: (lstat(bpf_intf::layer_stat_idx_LSTAT_MIN_EXEC_NS) / 1000) as u64,
-            open_idle: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_OPEN_IDLE),
-            preempt: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT),
-            preempt_xllc: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT_XLLC),
-            preempt_xnuma: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT_XNUMA),
-            preempt_first: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT_FIRST),
-            preempt_idle: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT_IDLE),
-            preempt_fail: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_PREEMPT_FAIL),
-            affn_viol: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_AFFN_VIOL),
-            keep: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_KEEP),
-            keep_fail_max_exec: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_KEEP_FAIL_MAX_EXEC),
-            keep_fail_busy: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_KEEP_FAIL_BUSY),
+            sel_local: lstat_pct(bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL),
+            enq_wakeup: lstat_pct(bpf_intf::layer_stat_id_LSTAT_ENQ_WAKEUP),
+            enq_expire: lstat_pct(bpf_intf::layer_stat_id_LSTAT_ENQ_EXPIRE),
+            enq_reenq: lstat_pct(bpf_intf::layer_stat_id_LSTAT_ENQ_REENQ),
+            min_exec: lstat_pct(bpf_intf::layer_stat_id_LSTAT_MIN_EXEC),
+            min_exec_us: (lstat(bpf_intf::layer_stat_id_LSTAT_MIN_EXEC_NS) / 1000) as u64,
+            open_idle: lstat_pct(bpf_intf::layer_stat_id_LSTAT_OPEN_IDLE),
+            preempt: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT),
+            preempt_xllc: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT_XLLC),
+            preempt_xnuma: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT_XNUMA),
+            preempt_first: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT_FIRST),
+            preempt_idle: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT_IDLE),
+            preempt_fail: lstat_pct(bpf_intf::layer_stat_id_LSTAT_PREEMPT_FAIL),
+            affn_viol: lstat_pct(bpf_intf::layer_stat_id_LSTAT_AFFN_VIOL),
+            keep: lstat_pct(bpf_intf::layer_stat_id_LSTAT_KEEP),
+            keep_fail_max_exec: lstat_pct(bpf_intf::layer_stat_id_LSTAT_KEEP_FAIL_MAX_EXEC),
+            keep_fail_busy: lstat_pct(bpf_intf::layer_stat_id_LSTAT_KEEP_FAIL_BUSY),
             is_excl: layer.kind.common().exclusive as u32,
-            excl_collision: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_EXCL_COLLISION),
-            excl_preempt: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_EXCL_PREEMPT),
-            kick: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_KICK),
-            yielded: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_YIELD),
-            yield_ignore: lstat(bpf_intf::layer_stat_idx_LSTAT_YIELD_IGNORE) as u64,
-            migration: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_MIGRATION),
-            xnuma_migration: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_XNUMA_MIGRATION),
-            xlayer_wake: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_XLAYER_WAKE),
-            xlayer_rewake: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_XLAYER_REWAKE),
-            xllc_migration: lstat_pct(bpf_intf::layer_stat_idx_LSTAT_XLLC_MIGRATION),
+            excl_collision: lstat_pct(bpf_intf::layer_stat_id_LSTAT_EXCL_COLLISION),
+            excl_preempt: lstat_pct(bpf_intf::layer_stat_id_LSTAT_EXCL_PREEMPT),
+            kick: lstat_pct(bpf_intf::layer_stat_id_LSTAT_KICK),
+            yielded: lstat_pct(bpf_intf::layer_stat_id_LSTAT_YIELD),
+            yield_ignore: lstat(bpf_intf::layer_stat_id_LSTAT_YIELD_IGNORE) as u64,
+            migration: lstat_pct(bpf_intf::layer_stat_id_LSTAT_MIGRATION),
+            xnuma_migration: lstat_pct(bpf_intf::layer_stat_id_LSTAT_XNUMA_MIGRATION),
+            xlayer_wake: lstat_pct(bpf_intf::layer_stat_id_LSTAT_XLAYER_WAKE),
+            xlayer_rewake: lstat_pct(bpf_intf::layer_stat_id_LSTAT_XLAYER_REWAKE),
+            xllc_migration: lstat_pct(bpf_intf::layer_stat_id_LSTAT_XLLC_MIGRATION),
             cpus: Self::bitvec_to_u32s(&layer.cpus),
             cur_nr_cpus: layer.cpus.count_ones() as u32,
             min_nr_cpus: nr_cpus_range.0 as u32,
             max_nr_cpus: nr_cpus_range.1 as u32,
             slice_us: stats.layer_slice_us[lidx],
+            llc_fracs: {
+                let sid = bpf_intf::llc_layer_stat_id_LLC_LSTAT_CNT as usize;
+                let sum = bstats.llc_lstats[lidx]
+                    .iter()
+                    .map(|lstats| lstats[sid])
+                    .sum::<u64>() as f64;
+                bstats.llc_lstats[lidx]
+                    .iter()
+                    .map(|lstats| calc_frac(lstats[sid] as f64, sum))
+                    .collect()
+            },
+            llc_lats: bstats.llc_lstats[lidx]
+                .iter()
+                .map(|lstats| {
+                    lstats[bpf_intf::llc_layer_stat_id_LLC_LSTAT_LAT as usize] as f64
+                        / 1_000_000_000.0
+                })
+                .collect(),
         }
     }
 
     pub fn format<W: Write>(&self, w: &mut W, name: &str, header_width: usize) -> Result<()> {
         writeln!(
             w,
-            "  {:<width$}: util/dcycle/frac={:5.1}/{:5.1}/{:7.1} tasks={:6}",
+            "  {:<width$}: util/open/frac={:6.1}/{}/{:7.1} tasks={:6} load={:9.2}",
             name,
             self.util,
-            self.dcycle,
+            fmt_pct(self.util_open),
             self.util_frac,
             self.tasks,
-            width = header_width,
-        )?;
-
-        writeln!(
-            w,
-            "  {:<width$}  load/load_frac_adj/frac={:9.2}/{:2.2}/{:5.1}",
-            "",
             self.load,
-            self.load_frac_adj,
-            self.load_frac,
             width = header_width,
         )?;
 
@@ -326,6 +343,27 @@ impl LayerStats {
             width = header_width
         )?;
 
+        for (i, (&frac, &lat)) in self.llc_fracs.iter().zip(self.llc_lats.iter()).enumerate() {
+            if i == 0 {
+                write!(
+                    w,
+                    "  {:<width$}  LLC sched%/lat_ms",
+                    "",
+                    width = header_width
+                )?;
+            } else if (i % 4) == 0 {
+                writeln!(w, "")?;
+                write!(
+                    w,
+                    "  {:<width$}                   ",
+                    "",
+                    width = header_width
+                )?;
+            }
+            write!(w, " [{}/{:7.2}]", fmt_pct(frac), lat * 1_000.0)?;
+        }
+        writeln!(w, "")?;
+
         if self.is_excl != 0 {
             writeln!(
                 w,
@@ -391,10 +429,10 @@ pub struct SysStats {
 impl SysStats {
     pub fn new(stats: &Stats, bstats: &BpfStats, fallback_cpu: usize) -> Result<Self> {
         let lsum = |idx| stats.bpf_stats.lstats_sums[idx as usize];
-        let total = lsum(bpf_intf::layer_stat_idx_LSTAT_SEL_LOCAL)
-            + lsum(bpf_intf::layer_stat_idx_LSTAT_ENQ_WAKEUP)
-            + lsum(bpf_intf::layer_stat_idx_LSTAT_ENQ_EXPIRE)
-            + lsum(bpf_intf::layer_stat_idx_LSTAT_ENQ_REENQ);
+        let total = lsum(bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL)
+            + lsum(bpf_intf::layer_stat_id_LSTAT_ENQ_WAKEUP)
+            + lsum(bpf_intf::layer_stat_id_LSTAT_ENQ_EXPIRE)
+            + lsum(bpf_intf::layer_stat_id_LSTAT_ENQ_REENQ);
         let lsum_pct = |idx| {
             if total != 0 {
                 lsum(idx) as f64 / total as f64 * 100.0
@@ -407,14 +445,14 @@ impl SysStats {
             at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),
             nr_nodes: stats.nr_nodes,
             total,
-            local: lsum_pct(bpf_intf::layer_stat_idx_LSTAT_SEL_LOCAL),
-            open_idle: lsum_pct(bpf_intf::layer_stat_idx_LSTAT_OPEN_IDLE),
-            affn_viol: lsum_pct(bpf_intf::layer_stat_idx_LSTAT_AFFN_VIOL),
-            excl_collision: lsum_pct(bpf_intf::layer_stat_idx_LSTAT_EXCL_COLLISION),
-            excl_preempt: lsum_pct(bpf_intf::layer_stat_idx_LSTAT_EXCL_PREEMPT),
-            excl_idle: bstats.gstats[bpf_intf::global_stat_idx_GSTAT_EXCL_IDLE as usize] as f64
+            local: lsum_pct(bpf_intf::layer_stat_id_LSTAT_SEL_LOCAL),
+            open_idle: lsum_pct(bpf_intf::layer_stat_id_LSTAT_OPEN_IDLE),
+            affn_viol: lsum_pct(bpf_intf::layer_stat_id_LSTAT_AFFN_VIOL),
+            excl_collision: lsum_pct(bpf_intf::layer_stat_id_LSTAT_EXCL_COLLISION),
+            excl_preempt: lsum_pct(bpf_intf::layer_stat_id_LSTAT_EXCL_PREEMPT),
+            excl_idle: bstats.gstats[bpf_intf::global_stat_id_GSTAT_EXCL_IDLE as usize] as f64
                 / total as f64,
-            excl_wakeup: bstats.gstats[bpf_intf::global_stat_idx_GSTAT_EXCL_WAKEUP as usize] as f64
+            excl_wakeup: bstats.gstats[bpf_intf::global_stat_id_GSTAT_EXCL_WAKEUP as usize] as f64
                 / total as f64,
             proc_ms: stats.processing_dur.as_millis() as u64,
             busy: stats.cpu_busy * 100.0,
@@ -463,8 +501,13 @@ impl SysStats {
             .unwrap_or(0)
             .max(4);
 
-        for (name, layer) in self.layers.iter() {
-            layer.format(w, name, header_width)?;
+        let mut idx_to_name: Vec<(usize, &String)> =
+            self.layers.iter().map(|(k, v)| (v.index, k)).collect();
+
+        idx_to_name.sort();
+
+        for (_idx, name) in &idx_to_name {
+            self.layers[*name].format(w, name, header_width)?;
         }
 
         Ok(())

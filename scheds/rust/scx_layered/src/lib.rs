@@ -96,20 +96,19 @@ impl CpuPool {
         let topo_map = TopologyMap::new(&topo).unwrap();
 
         let all_cpus = topo.cpus_bitvec();
-        let nr_cpus = topo.nr_cpus_online();
+        let nr_cpus = topo.nr_cpus_online;
         let core_cpus = topo_map.core_cpus_bitvec();
-        let nr_cores = topo.cores().len();
+        let nr_cores = topo.all_cores.len();
         let sibling_cpu = topo.sibling_cpus();
         let cpu_core = topo_map.cpu_core_mapping();
 
         // Build core_topology_to_id
         let mut core_topology_to_id = BTreeMap::new();
         let mut next_topo_id: usize = 0;
-        for node in topo.nodes() {
-            for llc in node.llcs().values() {
-                for core in llc.cores().values() {
-                    core_topology_to_id
-                        .insert((core.node_id, core.llc_id, core.id()), next_topo_id);
+        for node in topo.nodes.values() {
+            for llc in node.llcs.values() {
+                for core in llc.cores.values() {
+                    core_topology_to_id.insert((core.node_id, core.llc_id, core.id), next_topo_id);
                     next_topo_id += 1;
                 }
             }
@@ -204,22 +203,18 @@ impl CpuPool {
         Ok(())
     }
 
-    pub fn next_to_free<'a>(&'a self, cands: &BitVec) -> Result<Option<&'a BitVec>> {
-        let last = match cands.last_one() {
-            Some(ret) => ret,
-            None => return Ok(None),
-        };
-        let core = self.cpu_core[last];
-        if (self.core_cpus[core].clone() & !cands.clone()).count_ones() != 0 {
-            bail!(
-                "CPUs{} partially intersect with core {} ({})",
-                cands,
-                core,
-                self.core_cpus[core]
-            );
+    pub fn next_to_free<'a>(
+        &'a self,
+        cands: &BitVec,
+        core_order: impl Iterator<Item = &'a usize>,
+    ) -> Result<Option<&'a BitVec>> {
+        for pref_core in core_order {
+            let core_cpus = self.core_cpus[*pref_core].clone();
+            if (core_cpus & cands.clone()).count_ones() > 0 {
+                return Ok(Some(&self.core_cpus[*pref_core]));
+            }
         }
-
-        Ok(Some(&self.core_cpus[core]))
+        Ok(None)
     }
 
     pub fn available_cpus(&self) -> BitVec<u64, Lsb0> {
@@ -244,7 +239,7 @@ impl CpuPool {
     fn get_core_topological_id(&self, core: &Core) -> usize {
         *self
             .core_topology_to_id
-            .get(&(core.node_id, core.llc_id, core.id()))
+            .get(&(core.node_id, core.llc_id, core.id))
             .expect("unrecognised core")
     }
 }

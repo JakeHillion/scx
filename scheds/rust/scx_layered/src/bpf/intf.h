@@ -16,6 +16,7 @@
 #ifndef __KERNEL__
 typedef int s32;
 typedef long long s64;
+typedef unsigned short u16;
 typedef unsigned u32;
 typedef unsigned long long u64;
 #endif
@@ -28,6 +29,7 @@ typedef unsigned long long u64;
 #endif
 
 enum consts {
+	CACHELINE_SIZE		= 64,
 	MAX_CPUS_SHIFT		= 9,
 	MAX_CPUS		= 1 << MAX_CPUS_SHIFT,
 	MAX_CPUS_U8		= MAX_CPUS / 8,
@@ -43,6 +45,7 @@ enum consts {
 	MIN_LAYER_WEIGHT	= 1,
 	DEFAULT_LAYER_WEIGHT	= 100,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
+	LAYER_LAT_DECAY_FACTOR	= 4,
 
 	HI_FALLBACK_DSQ_BASE	= MAX_LAYERS * MAX_LLCS,
 	LO_FALLBACK_DSQ		= (MAX_LAYERS * MAX_LLCS) + MAX_LLCS + 1,
@@ -62,14 +65,21 @@ enum layer_kind {
 	LAYER_KIND_CONFINED,
 };
 
+enum layer_usage {
+	LAYER_USAGE_OWNED,
+	LAYER_USAGE_OPEN,
+
+	NR_LAYER_USAGES,
+};
+
 /* Statistics */
-enum global_stat_idx {
+enum global_stat_id {
 	GSTAT_EXCL_IDLE,
 	GSTAT_EXCL_WAKEUP,
 	NR_GSTATS,
 };
 
-enum layer_stat_idx {
+enum layer_stat_id {
 	LSTAT_SEL_LOCAL,
 	LSTAT_ENQ_WAKEUP,
 	LSTAT_ENQ_EXPIRE,
@@ -100,7 +110,23 @@ enum layer_stat_idx {
 	NR_LSTATS,
 };
 
+enum llc_layer_stat_id {
+	LLC_LSTAT_LAT,
+	LLC_LSTAT_CNT,
+	NR_LLC_LSTATS,
+};
+
+/* CPU proximity map from closest to farthest, starts with self */
+struct cpu_prox_map {
+	u16			cpus[MAX_CPUS];
+	u32			core_end;
+	u32			llc_end;
+	u32			node_end;
+	u32			sys_end;
+};
+
 struct cpu_ctx {
+	s32			cpu;
 	bool			current_preempt;
 	bool			current_exclusive;
 	bool			prev_exclusive;
@@ -108,29 +134,32 @@ struct cpu_ctx {
 	bool			yielding;
 	bool			try_preempt_first;
 	bool			is_big;
-	u64			layer_cycles[MAX_LAYERS];
+	u64			layer_usages[MAX_LAYERS][NR_LAYER_USAGES];
 	u64			gstats[NR_GSTATS];
 	u64			lstats[MAX_LAYERS][NR_LSTATS];
 	u64			ran_current_for;
 	u64			hi_fallback_dsq_id;
-	u32			layer_idx;
-	u32			cache_idx;
-	u32			node_idx;
+	u32			layer_id;
+	u32			task_layer_id;
+	u32			llc_id;
+	u32			node_id;
 	u32			perf;
+	struct cpu_prox_map	prox_map;
 };
 
-struct cache_ctx {
-	u32 id;
+struct llc_ctx {
+	u32			id;
 	struct bpf_cpumask __kptr *cpumask;
-	u32 nr_cpus;
+	u32			nr_cpus;
+	u64			lstats[MAX_LAYERS][NR_LLC_LSTATS];
 };
 
 struct node_ctx {
-	u32 id;
+	u32			id;
 	struct bpf_cpumask __kptr *cpumask;
-	u32 nr_llcs;
-	u32 nr_cpus;
-	u64 llc_mask;
+	u32			nr_llcs;
+	u32			nr_cpus;
+	u64			llc_mask;
 };
 
 enum layer_match_kind {
@@ -182,7 +211,7 @@ enum layer_growth_algo {
 struct layer {
 	struct layer_match_ands	matches[MAX_LAYER_MATCH_ORS];
 	unsigned int		nr_match_ors;
-	unsigned int		idx;
+	unsigned int		id;
 	u64			min_exec_ns;
 	u64			max_exec_ns;
 	u64			yield_step_ns;
@@ -204,8 +233,9 @@ struct layer {
 
 	u64			cpus_seq;
 	u64			node_mask;
-	u64			cache_mask;
-	unsigned int		refresh_cpus;
+	u64			llc_mask;
+	bool			check_no_idle;
+	u64			refresh_cpus;
 	unsigned char		cpus[MAX_CPUS_U8];
 	unsigned int		nr_cpus;	// managed from BPF side
 	unsigned int		perf;
