@@ -3,6 +3,8 @@ name: install-deps
 runs:
   using: 'composite'
   steps:
+    - uses: DeterminateSystems/nix-installer-action
+
     ### OTHER REPOS ####
     # turn off interactive, refresh pkgs
     - run: |
@@ -15,6 +17,12 @@ runs:
 
     ### DOWNLOAD AND INSTALL DEPENDENCIES ###
 
+    # Get some packages from nixpkgs for newer revisions
+    - run: |
+        nix registry add nixpkgs github:NixOS/nixpkgs/8edf06bea5bcbee082df1b7369ff973b91618b8d
+        nix profile install nixpkgs#stress-ng
+        echo "BPF_CLANG=$(nix eval --raw nixpkgs#clang)/bin/clang" >> $GITHUB_ENV
+
     # Download dependencies packaged by Ubuntu
     - run: |
         sudo apt install -f -y bison busybox-static cmake coreutils \
@@ -22,7 +30,7 @@ runs:
         libcap-dev libelf-dev libunwind-dev libvirt-clients libzstd-dev \
         linux-headers-generic linux-tools-common linux-tools-generic make \
         ninja-build pahole pkg-config python3-dev python3-pip python3-requests \
-        qemu-kvm rsync stress-ng udev zstd libseccomp-dev libcap-ng-dev \
+        qemu-kvm rsync udev zstd libseccomp-dev libcap-ng-dev \
         llvm clang python3-full curl meson bpftrace cargo rustc dwarves
       shell: bash
 
