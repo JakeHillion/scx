@@ -1,0 +1,26 @@
+[topology]
+
+[workload]
+type = "stress-ng"
+args = ["--cpu", "40", "--cpu-load", "65"]
+
+[scheduler]
+type = "layered"
+
+[[scheduler.config]]
+name = "all"
+comment = "all tasks"
+matches = [[]]
+kind = { Open = { min_exec_us = 0, slice_us = 2000, preempt = false, exclusive = false, growth_algo = "Random" } }
+
+[cases]
+  [cases.random_growth]
+    delay_s = 1
+    type = "bpftrace"
+    script = '''
+      BEGIN { exit(); }
+    '''
+    expect_json = '''
+      {}
+    '''
+    

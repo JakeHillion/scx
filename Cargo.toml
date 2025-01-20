@@ -12,7 +12,7 @@ members = ["rust/scx_stats",
            "scheds/rust/scx_rlfifo",
            "scheds/rust/scx_rusty",
            "scheds/rust/scx_layered",
-           "scheds/rust/scx_mitosis"]
+           "scheds/rust/scx_mitosis", "tests/scx_integration_test_framework", "tests/scx_layered_tests"]
 resolver = "2"
 
 [profile.release]

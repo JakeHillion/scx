@@ -1,0 +1,13 @@
+[package]
+name = "scx_layered_tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.65"
+scx_integration_test_framework = { path = "../scx_integration_test_framework" }
+env_logger = "*"
+
+[build-dependencies]
+anyhow = "1.0.65"
+scx_integration_test_framework = { path = "../scx_integration_test_framework" }
