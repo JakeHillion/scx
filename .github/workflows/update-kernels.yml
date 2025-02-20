@@ -1,0 +1,52 @@
+name: update-kernels
+on:
+  push: # TODO: remove me
+  workflow_dispatch:
+  schedule:
+    - cron: '31 5,11,17,23 * * *'
+
+jobs:
+  list-kernels:
+    runs-on: ${{ github.repository_owner == 'sched-ext' && fromJSON('[ "self-hosted", "linux", "x64" ]') || 'ubuntu-latest' }}
+    outputs:
+      matrix: ${{ steps.output.outputs.matrix }}
+    steps:
+      - name: Install Nix
+        if: ${{ runner.environment == 'github-hosted' }}
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: actions/checkout@v4
+
+      - uses: JakeHillion/nix-develop@2b6707695e9a29665e4756b84b169208d1f8109b # Get openssl from Nix if not available in path: https://github.com/nicknovitski/nix-develop/pull/26
+        with:
+          arguments: ./.github/workflows#update-kernels
+
+      - name: List kernels
+        id: output
+        run: |
+          matrix=$(jq -c 'keys' .github/workflows/kernel-versions.json)
+          echo $matrix
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  update-kernels:
+    runs-on: ${{ github.repository_owner == 'sched-ext' && fromJSON('[ "self-hosted", "linux", "x64" ]') || 'ubuntu-latest' }}
+    needs: list-kernels
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.list-kernels.outputs.matrix) }}
+
+    steps:
+      - name: Install Nix
+        if: ${{ runner.environment == 'github-hosted' }}
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: actions/checkout@v4
+
+      - name: Update kernels
+        run: |
+          nix run ./.github/workflows#update-kernels -- ${{ matrix.version }}
+          git diff --exit-code || echo 'modified=true' >> $GITHUB_ENV
+
+      # TODO: it would make a lot of sense here to build the kernel to build a cache on main before the PR, which I believe avoids building the kernel twice (or more times). it'll be pretty ugly though because it's a job instead of a step.
+
+      # TODO: send a PR. is there a way to do this silently so the commits end up in the merge queue without generating a visible PR, unless the tests fail? I think renovate does something like this, though I don't think it's merge queued.

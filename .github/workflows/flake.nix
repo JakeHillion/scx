@@ -15,6 +15,12 @@
             common = with pkgs; [ gnutar zstd ];
           in
           {
+            update-kernels = pkgs.mkShell {
+              buildInputs = with pkgs; common ++ [
+                jq
+              ];
+            };
+
             build-kernel = pkgs.mkShell {
               buildInputs = with pkgs; common ++ [
                 bc
@@ -31,8 +37,31 @@
               ];
             };
           };
-      }) // flake-utils.lib.eachDefaultSystem (system: {
-      formatter = nixpkgs.legacyPackages.${system}.nixpkgs-fmt;
-    });
+      }) // flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+      in
+      {
+        formatter = pkgs.nixpkgs-fmt;
+
+        apps = {
+          update-kernels =
+            let
+              script = pkgs.python3Packages.buildPythonApplication {
+                pname = "update-kernels";
+                version = "git";
+
+                pyproject = false;
+                dontUnpack = true;
+
+                installPhase = "install -Dm755 ${./update-kernels.py} $out/bin/update-kernels";
+              };
+            in
+            {
+              type = "app";
+              program = "${script}/bin/update-kernels";
+            };
+        };
+      });
 }
 
