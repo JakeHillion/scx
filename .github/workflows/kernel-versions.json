@@ -1,0 +1,20 @@
+{
+  "sched_ext/for-next": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git",
+    "branch": "for-next",
+    "commitHash": "6af48162ac098552d94068f45209d92d464aa56c",
+    "lastModified": 1740070567
+  },
+  "bpf/bpf-next": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git",
+    "branch": "master",
+    "commitHash": "7042882abc04c720ea798198981943502f4221fe",
+    "lastModified": 1740070567
+  },
+  "stable/linux-rolling-stable": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "branch": "linux-rolling-stable",
+    "commitHash": "c52eb03bad3cc2ca76edc938a5d302faafeaf165",
+    "lastModified": 1740070568
+  }
+}
