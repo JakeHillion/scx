@@ -8,36 +8,21 @@
 
   outputs = { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ]
-      (system: {
-        devShells =
-          let
-            pkgs = import nixpkgs { inherit system; };
-            common = with pkgs; [ gnutar zstd ];
-          in
-          {
-            update-kernels = pkgs.mkShell {
-              buildInputs = with pkgs; common ++ [
-                jq
-              ];
-            };
-
-            build-kernel = pkgs.mkShell {
-              buildInputs = with pkgs; common ++ [
-                bc
-                bison
-                cpio
-                elfutils
-                flex
-                git
-                openssl
-                pahole
-                perl
-                virtme-ng
-                zlib
-              ];
-            };
+      (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        {
+          packages = {
+            kernels = builtins.mapAttrs
+              (name: details: (pkgs.callPackage ./build-kernel.nix {
+                inherit name;
+                inherit (details) repo branch hash narHash;
+                version = details.kernelVersion;
+              }))
+              (builtins.fromJSON (builtins.readFile ./kernel-versions.json));
           };
-      }) // flake-utils.lib.eachDefaultSystem (system:
+        }) // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
       in
@@ -53,6 +38,8 @@
 
                 pyproject = false;
                 dontUnpack = true;
+
+                buildDependencies = with pkgs; [ gnumake ];
 
                 installPhase = "install -Dm755 ${./update-kernels.py} $out/bin/update-kernels";
               };
