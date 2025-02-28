@@ -4,6 +4,7 @@
 // GNU General Public License version 2.
 
 use crate::available_perf_events;
+use crate::bpf_intf;
 use crate::bpf_skel::BpfSkel;
 use crate::bpf_stats::BpfStats;
 use crate::config::get_config_path;
@@ -24,13 +25,14 @@ use crate::APP;
 use crate::LICENSE;
 use crate::SCHED_NAME_PATH;
 use crate::{
-    Action, CpuhpAction, GpuMemAction, IPIAction, RecordTraceAction, SchedCpuPerfSetAction,
-    SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction,
+    Action, CpuhpAction, GpuMemAction, IPIAction,  SchedCpuPerfSetAction,
+    SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction, TraceStartedAction,
 };
 
 use anyhow::Result;
 use glob::glob;
 use libbpf_rs::Link;
+use libbpf_rs::ProgramInput;
 use num_format::{SystemLocale, ToFormattedString};
 use protobuf::Message;
 use ratatui::prelude::Constraint;
@@ -58,6 +60,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DSQ_VTIME_CUTOFF: u64 = 1_000_000_000_000_000;
 
@@ -105,9 +108,9 @@ pub struct App<'a> {
     selected_event: usize,
     non_hw_event_active: bool,
 
-    // trace releated
+    // trace related
     trace_manager: PerfettoTraceManager,
-    trace_tick: usize,
+    trace_start: u64,
     prev_bpf_sample_rate: u32,
     process_id: i32,
     trace_links: Vec<Link>,
@@ -215,7 +218,7 @@ impl<'a> App<'a> {
             selected_event: 0,
             non_hw_event_active: false,
             prev_bpf_sample_rate: sample_rate,
-            trace_tick: 0,
+            trace_start: 0,
             trace_manager,
             bpf_stats: Default::default(),
             process_id,
@@ -446,13 +449,6 @@ impl<'a> App<'a> {
                         }
                         Ok::<(), anyhow::Error>(())
                     });
-                }
-            }
-            AppState::Tracing => {
-                self.trace_tick += 1;
-                // trace for max ticks and then exit tracing mode
-                if self.trace_tick > self.config.trace_ticks() + self.config.trace_tick_warmup() {
-                    return self.record_trace();
                 }
             }
             _ => {}
@@ -1741,9 +1737,7 @@ impl<'a> App<'a> {
                     "{}: record perfetto trace",
                     self.config
                         .active_keymap
-                        .action_keys_string(Action::RecordTrace(RecordTraceAction {
-                            immediate: false
-                        })),
+                        .action_keys_string(Action::RequestTrace),
                 ),
                 Style::default(),
             )),
@@ -2019,11 +2013,11 @@ impl<'a> App<'a> {
         let gauge = Gauge::default()
             .block(block)
             .gauge_style(self.theme().text_important_color())
-            .ratio(
-                (self.trace_tick as f64
-                    / (self.config.trace_ticks() + self.config.trace_tick_warmup()) as f64)
-                    .clamp(0.0_f64, 1.0_f64),
-            )
+            .ratio({
+                let now = std::time::Duration::from(nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)?).as_nanos() as u64;
+                (((now - self.trace_start) as f64) / (self.config.trace_duration_ns() as f64))
+                    .clamp(0.0_f64, 1.0_f64)
+            })
             .label(label);
         frame.render_widget(gauge, frame.area());
 
@@ -2121,7 +2115,8 @@ impl<'a> App<'a> {
     }
 
     /// Records the trace to perfetto output.
-    fn record_trace(&mut self) -> Result<()> {
+    fn stop_recording_trace(&mut self) -> Result<()> {
+        log::info!("stop_recording_trace");
         self.skel.maps.data_data.sample_rate = self.prev_bpf_sample_rate;
         self.state = self.prev_state.clone();
         self.trace_manager.stop()?;
@@ -2130,21 +2125,82 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// Request the BPF side start a trace.
+    fn request_start_trace(&mut self) -> Result<()> {
+        log::info!("request_start_trace");
+        if self.state == AppState::Tracing {
+            return Ok(());
+        };
+        log::info!("request_start_trace 2");
+
+        if self.trace_links.is_empty() {
+            self.attach_trace_progs()?;
+        }
+
+        let ret = self
+            .skel
+            .progs
+            .start_trace
+            .test_run(ProgramInput::default())?
+            .return_value;
+        if ret != 0 {
+            Err(anyhow::anyhow!(
+                "start_trace failed with exit code: {}",
+                ret
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Starts recording a trace.
-    fn start_trace(&mut self, immediate: bool) -> Result<()> {
+    fn start_recording_trace(
+        &mut self,
+        immediate: bool,
+        start_time: u64,
+        stop_scheduled: bool,
+    ) -> Result<()> {
+        log::info!("start_recording_trace");
         self.prev_state = self.state.clone();
         self.state = AppState::Tracing;
-        self.trace_tick = if immediate {
-            self.config.trace_tick_warmup()
+        self.trace_start = if immediate {
+            start_time
         } else {
-            0
+            start_time + self.config.trace_warmup_ns()
         };
         self.trace_manager.start()?;
 
-        // set bpf sampling to every event
-        self.prev_bpf_sample_rate = self.skel.maps.data_data.sample_rate;
-        self.skel.maps.data_data.sample_rate = 1;
-        self.attach_trace_progs()?;
+        if !stop_scheduled {
+            let mut args = bpf_intf::schedule_stop_trace_args {
+                stop_timestamp: self.trace_start + self.config.trace_duration_ns(),
+            };
+            let input = ProgramInput {
+                context_in: Some(unsafe {
+                    std::slice::from_raw_parts_mut(
+                        &mut args as *mut _ as *mut u8,
+                        std::mem::size_of_val(&args),
+                    )
+                }),
+                ..Default::default()
+            };
+
+            let ret = self
+                .skel
+                .progs
+                .schedule_stop_trace
+                .test_run(input)?
+                .return_value;
+            if ret != 0 {
+                return Err(anyhow::anyhow!(
+                    "schedule_stop_trace failed with exit code: {}",
+                    ret
+                ));
+            }
+        }
+
+        if self.trace_links.is_empty() {
+            self.attach_trace_progs()?;
+        }
 
         Ok(())
     }
@@ -2182,13 +2238,13 @@ impl<'a> App<'a> {
 
     /// Updates the app when a task wakes.
     fn on_sched_wakeup(&mut self, action: &SchedWakeupAction) {
-        if self.state == AppState::Tracing && self.trace_tick > self.config.trace_tick_warmup() {
+        if self.state == AppState::Tracing && action.ts > self.trace_start {
             self.trace_manager.on_sched_wakeup(action);
         }
     }
 
     fn on_sched_waking(&mut self, action: &SchedWakingAction) {
-        if self.state == AppState::Tracing && self.trace_tick > self.config.trace_tick_warmup() {
+        if self.state == AppState::Tracing && action.ts > self.trace_start {
             self.trace_manager.on_sched_waking(action);
         }
     }
@@ -2206,7 +2262,7 @@ impl<'a> App<'a> {
         } = action;
 
         if self.state == AppState::Tracing {
-            if self.trace_tick > self.config.trace_tick_warmup() {
+            if action.ts > self.trace_start {
                 self.trace_manager.on_sched_switch(action);
             }
             return;
@@ -2252,27 +2308,27 @@ impl<'a> App<'a> {
 
     /// Handles softirq events.
     pub fn on_softirq(&mut self, action: &SoftIRQAction) {
-        if self.trace_tick > self.config.trace_tick_warmup() {
+        if action.exit_ts > self.trace_start {
             self.trace_manager.on_softirq(action);
         }
     }
 
     /// Handles IPI events.
     pub fn on_ipi(&mut self, action: &IPIAction) {
-        if self.trace_tick > self.config.trace_tick_warmup() {
+        if action.ts > self.trace_start {
             self.trace_manager.on_ipi(action);
         }
     }
 
     pub fn on_gpu_mem(&mut self, action: &GpuMemAction) {
-        if self.trace_tick > self.config.trace_tick_warmup() {
+        if action.ts > self.trace_start {
             self.trace_manager.on_gpu_mem(action);
         }
     }
 
     /// Handles cpu hotplug events.
     pub fn on_cpu_hp(&mut self, action: &CpuhpAction) {
-        if self.trace_tick > self.config.trace_tick_warmup() {
+        if action.ts > self.trace_start {
             self.trace_manager.on_cpu_hp(action);
         }
     }
@@ -2324,8 +2380,14 @@ impl<'a> App<'a> {
             Action::SchedCpuPerfSet(SchedCpuPerfSetAction { cpu, perf }) => {
                 self.on_cpu_perf(*cpu, *perf);
             }
-            Action::RecordTrace(RecordTraceAction { immediate }) => {
-                self.start_trace(*immediate)?;
+            Action::RequestTrace => {
+                self.request_start_trace()?;
+            }
+            Action::TraceStarted(TraceStartedAction { ts, stop_scheduled }) => {
+                self.start_recording_trace(true /* immediate */, *ts, *stop_scheduled)?;
+            }
+            Action::TraceStopped => {
+                self.stop_recording_trace()?;
             }
             Action::ReloadStatsClient => {
                 self.reload_stats_client()?;

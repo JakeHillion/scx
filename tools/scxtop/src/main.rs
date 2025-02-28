@@ -22,8 +22,8 @@ use scxtop::APP;
 use scxtop::SCHED_NAME_PATH;
 use scxtop::STATS_SOCKET_PATH;
 use scxtop::{
-    Action, IPIAction, RecordTraceAction, SchedCpuPerfSetAction, SchedSwitchAction,
-    SchedWakeupAction, SchedWakingAction, SoftIRQAction,
+    Action, IPIAction, SchedCpuPerfSetAction, SchedSwitchAction, SchedWakeupAction,
+    SchedWakingAction, SoftIRQAction,
 };
 
 use anyhow::anyhow;
@@ -31,6 +31,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::ProgramInput;
 use libbpf_rs::RingBufferBuilder;
 use libbpf_rs::UprobeOpts;
 use ratatui::crossterm::event::KeyCode::Char;
@@ -107,6 +108,8 @@ fn run_tui(tui_args: &TuiArgs) -> Result<()> {
                 tui_args.experimental_long_tail_tracing_min_latency_ns;
 
             let skel = skel.load()?;
+
+            skel.progs.scxtop_init.test_run(ProgramInput::default())?;
 
             // Attach probes
             let mut links = vec![
