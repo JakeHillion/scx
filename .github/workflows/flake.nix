@@ -14,6 +14,7 @@
             pkgs = import nixpkgs { inherit system; };
             common = with pkgs; [ gnutar zstd ];
           in
+          rec
           {
             build-kernel = pkgs.mkShell {
               buildInputs = with pkgs; common ++ [
@@ -29,6 +30,18 @@
                 virtme-ng
                 zlib
               ];
+            };
+
+            selftests = pkgs.mkShell {
+              hardeningDisable = [
+                "fortify"
+                "stackprotector"
+                "zerocallusedregs"
+              ];
+              buildInputs = with pkgs; common ++ build-kernel.buildInputs ++ (with pkgs; [
+                clang
+                llvmPackages.bintools-unwrapped
+              ]);
             };
           };
       }) // flake-utils.lib.eachDefaultSystem (system: {
