@@ -21,15 +21,24 @@ use crate::{
     SchedWakingAction, SoftIRQAction,
 };
 
-use crate::protos_gen::perfetto_scx::counter_descriptor::Unit::UNIT_COUNT;
-use crate::protos_gen::perfetto_scx::trace_packet::Data::TrackDescriptor as DataTrackDescriptor;
-use crate::protos_gen::perfetto_scx::track_event::Type as TrackEventType;
-use crate::protos_gen::perfetto_scx::{
-    CounterDescriptor, CpuhpEnterFtraceEvent, FtraceEvent, FtraceEventBundle,
-    GpuMemTotalFtraceEvent, IpiRaiseFtraceEvent, SchedSwitchFtraceEvent, SchedWakeupFtraceEvent,
-    SchedWakingFtraceEvent, SoftirqEntryFtraceEvent, SoftirqExitFtraceEvent, Trace, TracePacket,
-    TrackDescriptor, TrackEvent,
-};
+use perfetto_protos::counter_descriptor::CounterDescriptor;
+use perfetto_protos::ftrace_event::FtraceEvent;
+use perfetto_protos::ftrace_event_bundle::FtraceEventBundle;
+use perfetto_protos::trace::Trace;
+use perfetto_protos::trace_packet::TracePacket;
+use perfetto_protos::track_descriptor::TrackDescriptor;
+use perfetto_protos::track_event::TrackEvent;
+use perfetto_protos::cpuhp::CpuhpEnterFtraceEvent;
+use perfetto_protos::gpu_mem::GpuMemTotalFtraceEvent;
+use perfetto_protos::ipi::IpiRaiseFtraceEvent;
+use perfetto_protos::sched::SchedSwitchFtraceEvent;
+use perfetto_protos::sched::SchedWakeupFtraceEvent;
+use perfetto_protos::sched::SchedWakingFtraceEvent;
+use perfetto_protos::irq::SoftirqEntryFtraceEvent;
+use perfetto_protos::irq::SoftirqExitFtraceEvent;
+use perfetto_protos::counter_descriptor::counter_descriptor::Unit as CounterUnit;
+use perfetto_protos::trace_packet::trace_packet::Data as TracePacketData;
+use perfetto_protos::track_event::track_event::Type as TrackEventType;
 
 /// Handler for perfetto traces. For details on data flow in perfetto see:
 /// https://perfetto.dev/docs/concepts/buffers and
@@ -116,7 +125,7 @@ impl PerfettoTraceManager {
 
             let mut counter_desc = CounterDescriptor::new();
             counter_desc.set_unit_name(format!("DSQ {} latency ns", *dsq));
-            counter_desc.set_unit(UNIT_COUNT);
+            counter_desc.set_unit(CounterUnit::UNIT_UNSPECIFIED);
             counter_desc.set_is_incremental(false);
             desc.counter = Some(counter_desc).into();
             descs.push(desc);
@@ -129,7 +138,7 @@ impl PerfettoTraceManager {
 
             let mut counter_desc = CounterDescriptor::new();
             counter_desc.set_unit_name(format!("DSQ {} nr_queued", *dsq));
-            counter_desc.set_unit(UNIT_COUNT);
+            counter_desc.set_unit(CounterUnit::UNIT_UNSPECIFIED);
             counter_desc.set_is_incremental(false);
             desc.counter = Some(counter_desc).into();
             descs.push(desc);
@@ -171,7 +180,7 @@ impl PerfettoTraceManager {
         for trace_descs in self.track_descriptors().values() {
             for trace_desc in trace_descs {
                 let mut packet = TracePacket::new();
-                packet.data = Some(DataTrackDescriptor(trace_desc.clone()));
+                packet.data = Some(TracePacketData::TrackDescriptor(trace_desc.clone()));
                 self.trace.packet.push(packet);
             }
         }
