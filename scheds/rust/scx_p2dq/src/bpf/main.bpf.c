@@ -14,6 +14,10 @@
 #include <scx/common.bpf.h>
 #endif
 
+#ifndef P2DQ_CREATE_STRUCT_OPS
+#define P2DQ_CREATE_STRUCT_OPS 1
+#endif
+
 #include "intf.h"
 
 #include <errno.h>
@@ -575,7 +579,7 @@ found_cpu:
 }
 
 
-s32 BPF_STRUCT_OPS(p2dq_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct task_ctx *taskc;
 	bool is_idle = false;
@@ -595,7 +599,7 @@ s32 BPF_STRUCT_OPS(p2dq_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wak
 }
 
 
-void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_flags)
+static __always_inline void p2dq_enqueue_impl(struct task_struct *p, u64 enq_flags)
 {
 	struct llc_ctx *llcx, *prev_llcx;
 	struct cpu_ctx *cpuc, *task_cpuc;
@@ -679,8 +683,7 @@ void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_f
 	scx_bpf_dsq_insert_vtime(p, dsq_id, slice_ns, vtime, enq_flags);
 }
 
-
-void BPF_STRUCT_OPS(p2dq_runnable, struct task_struct *p, u64 enq_flags)
+static __always_inline void p2dq_runnable_impl(struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *wakee_ctx;
 
@@ -1289,7 +1292,7 @@ s32 static start_timers(void)
 	return 0;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(p2dq_init)
+static __always_inline s32 p2dq_init_impl()
 {
 	int i, ret;
 	struct bpf_cpumask *tmp_cpumask, *tmp_big_cpumask;
@@ -1381,10 +1384,30 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(p2dq_init)
 	return 0;
 }
 
-
 void BPF_STRUCT_OPS(p2dq_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
+}
+
+#if P2DQ_CREATE_STRUCT_OPS
+void BPF_STRUCT_OPS(p2dq_runnable, struct task_struct *p, u64 enq_flags)
+{
+	return p2dq_runnable_impl(p, enq_flags);
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(p2dq_init)
+{
+	return p2dq_init_impl();
+}
+
+void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_flags)
+{
+	return p2dq_enqueue_impl(p, enq_flags);
+}
+
+s32 BPF_STRUCT_OPS(p2dq_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+{
+	return p2dq_select_cpu_impl(p, prev_cpu, wake_flags);
 }
 
 SCX_OPS_DEFINE(p2dq,
@@ -1400,3 +1423,4 @@ SCX_OPS_DEFINE(p2dq,
 	       .exit			= (void *)p2dq_exit,
 	       .timeout_ms		= 20000,
 	       .name			= "p2dq");
+#endif

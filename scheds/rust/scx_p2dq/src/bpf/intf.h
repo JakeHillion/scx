@@ -2,8 +2,8 @@
 
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
-#ifndef __INTF_H
-#define __INTF_H
+#ifndef __P2DQ_INTF_H
+#define __P2DQ_INTF_H
 
 #include <stdbool.h>
 #ifndef __kptr
@@ -126,4 +126,4 @@ struct node_ctx {
 	struct bpf_cpumask __kptr	*big_cpumask;
 };
 
-#endif /* __INTF_H */
+#endif /* __P2DQ_INTF_H */
