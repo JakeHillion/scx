@@ -469,6 +469,9 @@ mod tests {
 
     #[test]
     fn test_bpf_builder_new() {
+        // TODO: this directory is created, we need to create a temporary directory for it
+        std::env::set_var("OUT_DIR", "mustbeset");
+
         let res = super::BpfBuilder::new();
         assert!(res.is_ok(), "Failed to create BpfBuilder ({:?})", &res);
     }
