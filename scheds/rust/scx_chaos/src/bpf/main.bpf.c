@@ -32,6 +32,9 @@
 	  scx_bpf_dsq_move_vtime((it__iter), (p), (dsq_id), (enq_flags)) :			\
 	  scx_bpf_dispatch_vtime_from_dsq___compat((it__iter), (p), (dsq_id), (enq_flags)))
 
+const volatile int ppid_targeting_ppid = 1;
+const volatile bool ppid_targeting_inclusive = false; /* include ppid_targeting_ppid in chaos */
+
 const volatile u64 chaos_timer_check_queues_min_ns = 500000;
 const volatile u64 chaos_timer_check_queues_max_ns = 2000000;
 const volatile u64 chaos_timer_check_queues_slack_ns = 2500000;
@@ -69,8 +72,11 @@ struct chaos_task_ctx *lookup_create_chaos_task_ctx(struct task_struct *p)
 	return bpf_task_storage_get(&chaos_task_ctxs, p, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
 }
 
-static __always_inline enum chaos_trait_kind choose_chaos()
+static __always_inline enum chaos_trait_kind choose_chaos(struct chaos_task_ctx *taskc)
 {
+	if (taskc->policy == CHAOS_POLICY_NONE)
+		return CHAOS_TRAIT_NONE;
+
 	if (bpf_get_prandom_u32() < random_delays_freq_frac32)
 		return CHAOS_TRAIT_RANDOM_DELAYS;
 
@@ -87,6 +93,97 @@ static __always_inline u64 get_cpu_delay_dsq(int cpu_idx)
 	// into linear IDs with topology information passed from userspace
 	cpu_idx = bpf_get_smp_processor_id();
 	return CHAOS_DSQ_BASE | cpu_idx;
+}
+
+static __always_inline s32 calculate_chaos_policy(struct task_struct *p)
+{
+	struct chaos_task_ctx *taskc;
+	int limit = 0;
+	struct task_struct *parent;
+	int ret = 0;
+	int pid;
+
+	if (ppid_targeting_ppid == -1 || (ppid_targeting_inclusive && ppid_targeting_ppid == p->pid)) {
+		if (!(taskc = lookup_create_chaos_task_ctx(p))) {
+			scx_bpf_error("couldn't create task context");
+			return -EINVAL;
+		}
+
+		taskc->policy = CHAOS_POLICY_NORMAL;
+		return 0;
+	}
+
+	if (!p->real_parent || !(pid = p->real_parent->pid)) {
+		if (!(taskc = lookup_create_chaos_task_ctx(p))) {
+			scx_bpf_error("couldn't create task context");
+			return -EINVAL;
+		}
+
+		taskc->policy = CHAOS_POLICY_NONE;
+		return 0;
+	}
+
+	bpf_repeat(CHAOS_NUM_PPIDS_CHECK) {
+		parent = bpf_task_from_pid(pid);
+		if (!parent) {
+			dbg("hillion: %d: no match\n", pid);
+			break;
+		}
+		dbg("hillion: %d: has match\n", pid);
+
+		if (!(taskc = lookup_create_chaos_task_ctx(parent))) {
+			bpf_task_release(parent);
+			scx_bpf_error("couldn't create task context");
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (taskc->policy == CHAOS_POLICY_NORMAL) {
+			limit = parent->pid;
+			bpf_task_release(parent);
+			break;
+		}
+
+		if (parent->pid == ppid_targeting_ppid) {
+			limit = parent->pid;
+			bpf_task_release(parent);
+			break;
+		}
+
+		if (!parent->real_parent || !(pid = p->real_parent->pid)) {
+			bpf_task_release(parent);
+			break;
+		}
+
+		bpf_task_release(parent);
+	}
+
+	pid = p->pid;
+
+	bpf_repeat(CHAOS_NUM_PPIDS_CHECK) {
+		parent = bpf_task_from_pid(pid);
+		if (!parent)
+			break;
+
+		if (!(taskc = lookup_create_chaos_task_ctx(parent))) {
+			bpf_task_release(parent);
+			scx_bpf_error("couldn't create task context");
+			ret = -EINVAL;
+			goto out;
+		}
+
+		taskc->policy = limit ? CHAOS_POLICY_NORMAL : CHAOS_POLICY_NONE;
+
+		if (!parent->real_parent || !(pid = p->real_parent->pid)) {
+			bpf_task_release(parent);
+			break;
+		}
+
+		bpf_task_release(parent);
+	}
+
+out:
+	return ret;
 }
 
 __weak s32 enqueue_random_delay(struct task_struct *p __arg_trusted, u64 enq_flags,
@@ -123,12 +220,6 @@ __weak s32 enqueue_chaotic(struct task_struct *p __arg_trusted, u64 enq_flags,
 	taskc->next_trait = CHAOS_TRAIT_NONE;
 	return out;
 }
-
-enum dsq_check_result {
-	CHAOS_DSQ_CHECK_OKAY,
-	CHAOS_DSQ_CHECK_DISPATCH_NOW,
-	CHAOS_DSQ_CHECK_DISPATCH_SLOW,
-};
 
 /*
  * Walk a CPU's delay dsq and kick it if the task should already have been
@@ -329,12 +420,12 @@ void BPF_STRUCT_OPS(chaos_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 
 void BPF_STRUCT_OPS(chaos_runnable, struct task_struct *p, u64 enq_flags)
 {
-	enum chaos_trait_kind t = choose_chaos();
-	if (t == CHAOS_TRAIT_NONE)
-		goto p2dq;
-
 	struct chaos_task_ctx *wakee_ctx;
 	if (!(wakee_ctx = lookup_create_chaos_task_ctx(p)))
+		goto p2dq;
+
+	enum chaos_trait_kind t = choose_chaos(wakee_ctx);
+	if (t == CHAOS_TRAIT_NONE)
 		goto p2dq;
 
 	wakee_ctx->next_trait = t;
@@ -356,18 +447,36 @@ p2dq:
 	return p2dq_select_cpu_impl(p, prev_cpu, wake_flags);
 }
 
-SCX_OPS_DEFINE(chaos,
-	       .select_cpu		= (void *)chaos_select_cpu,
-	       .enqueue			= (void *)chaos_enqueue,
-	       .runnable		= (void *)chaos_runnable,
-	       .init			= (void *)chaos_init,
-	       .dispatch		= (void *)chaos_dispatch,
+s32 BPF_STRUCT_OPS_SLEEPABLE(chaos_init_task, struct task_struct *p,
+			     struct scx_init_task_args *args)
+{
+	s32 ret = p2dq_init_task_impl(p, args);
+	if (ret)
+		return ret;
 
-	       .running			= (void *)p2dq_running,
-	       .stopping		= (void *)p2dq_stopping,
-	       .set_cpumask		= (void *)p2dq_set_cpumask,
-	       .init_task		= (void *)p2dq_init_task,
+	ret = calculate_chaos_policy(p);
+	if (ret)
+		return ret;
+
+	struct chaos_task_ctx *taskc = lookup_create_chaos_task_ctx(p);
+	if (taskc)
+		dbg("hillion: %s: %d\n", p->comm, taskc->policy);
+
+	return 0;
+}
+
+SCX_OPS_DEFINE(chaos,
+	       .dispatch		= (void *)chaos_dispatch,
+	       .enqueue			= (void *)chaos_enqueue,
+	       .init			= (void *)chaos_init,
+	       .init_task		= (void *)chaos_init_task,
+	       .runnable		= (void *)chaos_runnable,
+	       .select_cpu		= (void *)chaos_select_cpu,
+
 	       .exit			= (void *)p2dq_exit,
+	       .running			= (void *)p2dq_running,
+	       .set_cpumask		= (void *)p2dq_set_cpumask,
+	       .stopping		= (void *)p2dq_stopping,
 
 	       .timeout_ms		= 30000,
 	       .name			= "chaos");
