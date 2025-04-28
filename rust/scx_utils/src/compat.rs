@@ -293,7 +293,6 @@ pub fn check_min_requirements() -> Result<()> {
 /// is used to define ops, and scx_ops_open!(), scx_ops_load!(), and
 /// scx_ops_attach!() are used to open, load and attach it, backward
 /// compatibility is automatically maintained where reasonable.
-#[rustfmt::skip]
 #[macro_export]
 macro_rules! scx_ops_open {
     ($builder: expr, $obj_ref: expr, $ops: ident) => { 'block: {
@@ -349,44 +348,46 @@ macro_rules! scx_ops_open {
 /// is used to define ops, and scx_ops_open!(), scx_ops_load!(), and
 /// scx_ops_attach!() are used to open, load and attach it, backward
 /// compatibility is automatically maintained where reasonable.
-#[rustfmt::skip]
 #[macro_export]
 macro_rules! scx_ops_load {
-    ($skel: expr, $ops: ident, $uei: ident) => { 'block: {
-        scx_utils::paste! {
-            use ::anyhow::Context;
-            use ::libbpf_rs::skel::OpenSkel;
+    ($skel: expr, $ops: ident, $uei: ident) => {
+        'block: {
+            scx_utils::paste! {
+                use ::anyhow::Context;
+                use ::libbpf_rs::skel::OpenSkel;
 
-            scx_utils::uei_set_size!($skel, $ops, $uei);
-            $skel.load().context("Failed to load BPF program")
+                scx_utils::uei_set_size!($skel, $ops, $uei);
+                $skel.load().context("Failed to load BPF program")
+            }
         }
-    }};
+    };
 }
 
 /// Must be used together with scx_ops_load!(). See there.
-#[rustfmt::skip]
 #[macro_export]
 macro_rules! scx_ops_attach {
-    ($skel: expr, $ops: ident) => { 'block: {
-        use ::anyhow::Context;
-        use ::libbpf_rs::skel::Skel;
+    ($skel: expr, $ops: ident) => {
+        'block: {
+            use ::anyhow::Context;
+            use ::libbpf_rs::skel::Skel;
 
-        if scx_utils::compat::is_sched_ext_enabled().unwrap_or(false) {
-            break 'block Err(anyhow::anyhow!(
-                "another sched_ext scheduler is already running"
-            ));
+            if scx_utils::compat::is_sched_ext_enabled().unwrap_or(false) {
+                break 'block Err(anyhow::anyhow!(
+                    "another sched_ext scheduler is already running"
+                ));
+            }
+            $skel
+                .attach()
+                .context("Failed to attach non-struct_ops BPF programs")
+                .and_then(|_| {
+                    $skel
+                        .maps
+                        .$ops
+                        .attach_struct_ops()
+                        .context("Failed to attach struct_ops BPF programs")
+                })
         }
-        $skel
-            .attach()
-            .context("Failed to attach non-struct_ops BPF programs")
-            .and_then(|_| {
-                $skel
-                    .maps
-                    .$ops
-                    .attach_struct_ops()
-                    .context("Failed to attach struct_ops BPF programs")
-            })
-    }};
+    };
 }
 
 #[cfg(test)]
