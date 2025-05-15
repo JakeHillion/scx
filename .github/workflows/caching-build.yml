@@ -7,13 +7,28 @@ on:
 
 jobs:
   build-kernel:
+    runs-on: ${{ github.repository_owner == 'sched-ext' && fromJSON('[ "self-hosted", "linux", "x64" ]') || 'ubuntu-latest' }}
+    steps:
+      - name: Install Nix
+        if: ${{ runner.environment == 'github-hosted' }}
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-kernel
+        with:
+          repo-name: sched_ext/for-next
+
+  build-kernel-legacy:
     uses: ./.github/workflows/build-kernel.yml
     with:
       repo-name: sched_ext/for-next
 
   rust-tests:
     runs-on: ${{ github.repository_owner == 'sched-ext' && fromJSON('[ "self-hosted", "linux", "x64" ]') || 'ubuntu-latest' }}
-    needs: build-kernel
+    needs:
+      - build-kernel
+      - build-kernel-legacy
     steps:
       - name: Install Nix
         if: ${{ runner.environment == 'github-hosted' }}
@@ -24,7 +39,7 @@ jobs:
       - name: Load dependencies
         run: nix run ./.github/include#nix-develop-gha -- ./.github/include#restore-kernels
 
-      - uses: ./.github/actions/restore-kernel-cache
+      - uses: ./.github/actions/build-kernel
         with:
           repo-name: sched_ext/for-next
 
@@ -42,7 +57,9 @@ jobs:
 
   integration-test:
     uses: ./.github/workflows/integration-tests.yml
-    needs: build-kernel
+    needs:
+      - build-kernel
+      - build-kernel-legacy
     with:
       repo-name: sched_ext/for-next
 

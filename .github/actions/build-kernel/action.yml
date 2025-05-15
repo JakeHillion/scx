@@ -1,0 +1,45 @@
+name: 'Build kernel'
+description: 'Build a kernel with Nix, restoring a previously built cache if available'
+inputs:
+  repo-name:
+    required: true
+    type: string
+
+runs:
+  using: "composite"
+  steps:
+    - name: Get Nix store path
+      run: |
+        echo "KERNEL_STORE_PATH=$(nix eval --raw ./.github/include#kernels.'${{ inputs.repo-name }}'.outPath)" >> $GITHUB_ENV
+        echo "KERNEL_HEADERS_STORE_PATH=$(nix eval --raw ./.github/include#kernels.'${{ inputs.repo-name }}'.headers.outPath)" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Attempt to load cache
+      id: cache-kernel-nar
+      uses: actions/cache/restore@v4
+      with:
+        key: nar-${{ env.KERNEL_STORE_PATH }}-3
+        path: .cache/nar/kernel-closure.nar
+
+    - name: Build kernel and prepare cache entry
+      if: steps.cache-kernel-nar.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        nix build --no-link ./.github/include#kernels.'${{ inputs.repo-name }}'{,.headers}
+
+        mkdir -p .cache/nar
+        nix-store --export \
+            $(nix-store --query --requisites $KERNEL_STORE_PATH $KERNEL_HEADERS_STORE_PATH) \
+            > .cache/nar/kernel-closure.nar
+
+    - name: Save cache
+      if: steps.cache-kernel-nar.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        key: nar-${{ env.KERNEL_STORE_PATH }}-3
+        path: .cache/nar/kernel-closure.nar
+
+    - name: Unpack cache
+      if: steps.cache-kernel-nar.outputs.cache-hit == 'true'
+      run: nix-store --import < .cache/nar/kernel-closure.nar
+      shell: bash
