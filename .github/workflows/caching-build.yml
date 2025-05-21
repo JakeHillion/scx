@@ -52,6 +52,7 @@ jobs:
     needs: build-kernel
     with:
       repo-name: sched_ext/for-next
+      cachix-auth-token: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
   pages:
     runs-on: ubuntu-24.04

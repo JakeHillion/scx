@@ -25,6 +25,7 @@ jobs:
     needs: build-kernel
     with:
       repo-name: bpf/bpf-next
+      cachix-auth-token: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
   notify-job:
     runs-on: ubuntu-latest
