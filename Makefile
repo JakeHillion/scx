@@ -79,8 +79,8 @@ ifeq ($(SCHED_OBJ_DIR),)
 endif
 
 # Scheduler lists for convenience targets
-C_SCHEDS := scx_simple scx_qmap scx_central scx_userland scx_nest scx_flatcg scx_pair scx_prev
-C_SCHEDS_LIB := scx_sdt
+# Include scheduler definitions from metadata
+include scheds/c/scheds.mk
 
 all: lib scheds-c
 

@@ -233,14 +233,61 @@ async def run_format():
     print("✓ Format completed successfully", flush=True)
 
 
+def get_host_system() -> str:
+    """Detect the host system for Nix."""
+    import platform
+
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+
+    if system != "linux":
+        raise RuntimeError(f"sched_ext is only supported on Linux, detected: {system}")
+
+    if machine in ["x86_64", "amd64"]:
+        return "x86_64-linux"
+    elif machine in ["aarch64", "arm64"]:
+        return "aarch64-linux"
+    else:
+        raise RuntimeError(f"Unsupported architecture: {machine}")
+
+
+async def get_flake_targets() -> List[str]:
+    """Get all buildable targets from the flake for the host system."""
+    host_system = get_host_system()
+    print(f"Detected host system: {host_system}", flush=True)
+
+    stdout = await run_command(["nix", "flake", "show", "--json", ".github/include"])
+    flake_data = json.loads(stdout)
+
+    targets = []
+
+    packages = flake_data.get("packages", {}).get(host_system, {})
+    for package_name in packages:
+        targets.append(f"./.github/include#{package_name}")
+
+    devshells = flake_data.get("devShells", {}).get(host_system, {})
+    for devshell_name in devshells:
+        targets.append(f"./.github/include#devShells.{host_system}.{devshell_name}")
+
+    print(f"Found {len(targets)} buildable targets for {host_system}", flush=True)
+    return targets
+
+
 async def run_build():
-    """Build all targets."""
+    """Build all targets with Nix."""
     print("Running build...", flush=True)
 
-    print("Building C schedulers...", flush=True)
-    await run_command(["make", "all"], no_capture=True)
-    print("Building Rust schedulers...", flush=True)
-    await run_command(["cargo", "build", "--all-targets", "--locked"], no_capture=True)
+    print("Discovering buildable targets from flake...", flush=True)
+    targets = await get_flake_targets()
+
+    print(
+        "Building all flake outputs (packages, devshells, kernels, tools, schedulers)...",
+        flush=True,
+    )
+    await run_command(
+        ["nix", "build", "--no-link", "--log-format", "bar-with-logs"] + targets,
+        no_capture=True,
+    )
 
     print("✓ Build completed successfully", flush=True)
 
@@ -263,8 +310,17 @@ async def run_tests():
     """Run the test suite."""
     print("Running tests...", flush=True)
 
-    # Make sure the selftest is built in case the build was not already run.
-    await run_command(["cargo", "build", "-p", "scx_lib_selftests"], no_capture=True)
+    # Build scx_rust_extra package containing scx_lib_selftests and other tools
+    stdout = await run_command(
+        [
+            "nix",
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "./.github/include#scx_rust_extra",
+        ]
+    )
+    scx_rust_extra_path = stdout.strip()
 
     await run_command(
         [
@@ -285,6 +341,7 @@ async def run_tests():
         [
             sys.argv[0],
             "test-in-vm",
+            f"{scx_rust_extra_path}/bin/scx_lib_selftests",
         ],
         memory=10 * 1024 * 1024 * 1024,
         cpus=cpu_count,
@@ -603,12 +660,20 @@ async def run_veristat():
 
 
 async def extract_bpf_objects(scheduler_name: str, output_dir: str) -> List[str]:
-    """Extract BPF objects from scheduler binary using existing script."""
+    """Extract BPF objects from Nix-built scheduler binary using existing script."""
 
-    # Find the scheduler binary in target/debug
-    binary_path = f"target/debug/{scheduler_name}"
-    if not os.path.exists(binary_path):
-        raise Exception(f"Warning: Scheduler binary {binary_path} not found")
+    print(f"Building {scheduler_name} with Nix for BPF extraction...", flush=True)
+    stdout = await run_command(
+        [
+            "nix",
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            f"./.github/include#{scheduler_name}",
+        ]
+    )
+    nix_store_path = stdout.strip()
+    binary_path = f"{nix_store_path}/bin/{scheduler_name}"
 
     result = await run_command(
         ["./scripts/extract_bpf_objects.sh", binary_path, output_dir]
@@ -633,9 +698,6 @@ async def run_veristat_debug(kernel_name: str, scheduler_name: str, symbol_name:
         f"Running veristat debug mode for {scheduler_name} on {kernel_name}, symbol: {symbol_name}",
         flush=True,
     )
-
-    # Build the specific scheduler first
-    await run_command(["cargo", "build", "-p", scheduler_name], no_capture=True)
 
     # Create temporary directory for BPF object extraction
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -667,7 +729,7 @@ async def run_veristat_debug(kernel_name: str, scheduler_name: str, symbol_name:
         )
 
 
-async def run_tests_in_vm():
+async def run_tests_in_vm(scx_lib_selftests_path: str):
     """Run tests when already inside the VM."""
 
     subprocess.run(
@@ -684,7 +746,8 @@ async def run_tests_in_vm():
         check=True,
     )
 
-    subprocess.run(["target/debug/scx_lib_selftests"], check=True)
+    # Run scx_lib_selftests from the path passed as argument
+    subprocess.run([scx_lib_selftests_path], check=True)
 
 
 async def run_all():
@@ -729,6 +792,10 @@ async def main():
         "test-in-vm",
         help="Run Rust tests in VM (intended to be invoked by this script)",
     )
+    parser_test_in_vm.add_argument(
+        "scx_lib_selftests_path",
+        help="Path to scx_lib_selftests binary",
+    )
 
     args = parser.parse_args()
 
@@ -756,7 +823,7 @@ async def main():
         else:
             await run_veristat()
     elif args.command == "test-in-vm":
-        await run_tests_in_vm()
+        await run_tests_in_vm(args.scx_lib_selftests_path)
     elif args.command == "all":
         await run_all()
 

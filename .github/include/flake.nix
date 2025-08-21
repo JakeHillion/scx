@@ -15,6 +15,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    crane = {
+      url = "github:ipetkov/crane";
+    };
+
     nix-develop-gha.url = "github:nicknovitski/nix-develop";
     nix-develop-gha.inputs.nixpkgs.follows = "nixpkgs";
 
@@ -29,7 +33,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, fenix, nix-develop-gha, libbpf-src, veristat-src, ... }:
+  outputs = { self, nixpkgs, flake-utils, fenix, crane, nix-develop-gha, libbpf-src, veristat-src, ... }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ]
       (system:
         let
@@ -53,6 +57,22 @@
             "rustc"
             "rustfmt"
           ];
+
+          craneLib = crane.mkLib pkgs;
+          craneBuild = craneLib.overrideToolchain rust-toolchain;
+
+          src = lib.cleanSourceWith {
+            src = ../..;
+            filter = path: type:
+              (lib.hasSuffix "Cargo.toml" path) ||
+              (lib.hasSuffix "Cargo.lock" path) ||
+              (lib.hasSuffix ".rs" path) ||
+              (lib.hasSuffix ".h" path) ||
+              (lib.hasSuffix ".c" path) ||
+              (lib.hasSuffix ".bpf.c" path) ||
+              (type == "symlink") ||
+              (type == "directory");
+          };
 
           makeBpfClang = llvmPackages: kernel: pkgs.stdenv.mkDerivation {
             pname = "bpf-clang";
@@ -81,6 +101,99 @@
             LIBCLANG_PATH = "${lib.getLib pkgs.llvmPackages.libclang}/lib";
           };
 
+          # Common crane arguments
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              clang
+              llvmPackages.libclang
+            ];
+
+            buildInputs = with pkgs; [
+              elfutils
+              libbpf
+              libseccomp
+              protobuf
+              zlib
+              zstd
+            ];
+
+            env = build-env-vars;
+          };
+
+          cargoArtifacts = craneBuild.buildDepsOnly (commonArgs // {
+            pname = "scx-workspace";
+            version = "git";
+          });
+
+          individualCrateArgs = commonArgs // {
+            inherit cargoArtifacts;
+            doCheck = false;
+          };
+
+          # Rust scheduler names for reuse in multiple places
+          schedulerNames = builtins.attrNames (lib.filterAttrs (name: type: type == "directory") (builtins.readDir (src + "/scheds/rust")));
+
+          makeCargoSchedulerPackage = name:
+            let
+              cargoToml = src + "/scheds/rust/${name}/Cargo.toml";
+              crateInfo = craneLib.crateNameFromCargoToml { inherit cargoToml; };
+            in
+            craneBuild.buildPackage (individualCrateArgs // crateInfo // {
+              cargoExtraArgs = "-p ${name}";
+
+              meta = with lib; {
+                description = "sched_ext scheduler: ${name}";
+                homepage = "https://github.com/sched-ext/scx";
+                license = licenses.gpl2Only;
+                maintainers = [ ];
+                platforms = platforms.linux;
+              };
+            });
+
+
+          makeMakeSchedulerPackage = name: pkgs.stdenv.mkDerivation {
+            pname = name;
+            version = "git";
+
+            src = ../..;
+
+            nativeBuildInputs = with pkgs; [
+              bpftools
+              gcc
+              gnumake
+              pkg-config
+            ];
+
+            buildInputs = with pkgs; [
+              elfutils
+              libbpf-git
+              libseccomp
+              zlib
+              zstd
+            ];
+
+            BPF_CLANG = lib.getExe self.packages.${system}.bpf-clang;
+            BPFTOOL = "${pkgs.bpftools}/bin/bpftool";
+
+            buildPhase = ''
+              make ${name}
+            '';
+
+            installPhase = ''
+              mkdir -p $out/bin
+              cp build/scheds/c/${name} $out/bin/
+            '';
+
+            meta = {
+              description = "SCX ${name} scheduler";
+              license = lib.licenses.gpl2;
+              platforms = lib.platforms.linux;
+            };
+          };
           gha-common-pkgs = with pkgs; [
             cachix
             git
@@ -234,6 +347,39 @@
 
               installPhase = "install -Dm755 ${../include/ci.py} $out/bin/ci";
             };
+
+          } // builtins.listToAttrs (builtins.map
+            (name: {
+              name = name;
+              value = makeCargoSchedulerPackage name;
+            })
+            schedulerNames) // { } // builtins.listToAttrs (builtins.map
+            (name: {
+              name = name;
+              value = makeMakeSchedulerPackage name;
+            })
+            (builtins.attrNames (builtins.fromJSON (builtins.readFile (../../scheds/c/metadata.json))))) // {
+
+
+            # Build all remaining workspace crates (tools, libraries, tests) excluding schedulers
+            scx_rust_extra =
+              let
+                excludeArgs = lib.concatStringsSep " " (builtins.map (name: "--exclude ${name}") schedulerNames);
+              in
+              craneBuild.buildPackage (individualCrateArgs // {
+                pname = "scx_rust_extra";
+                version = "git";
+
+                cargoExtraArgs = "--workspace ${excludeArgs}";
+
+                meta = with lib; {
+                  description = "sched_ext tools, libraries, and tests";
+                  homepage = "https://github.com/sched-ext/scx";
+                  license = licenses.gpl2Only;
+                  maintainers = [ ];
+                  platforms = platforms.linux;
+                };
+              });
           } // (with lib.attrsets; mapAttrs'
             (name: details: nameValuePair "kernel_${name}" (pkgs.callPackage ./build-kernel.nix {
               inherit name;
